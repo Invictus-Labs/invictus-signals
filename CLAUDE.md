@@ -18,7 +18,8 @@ Shared library for regime classification, 7-color line detection, pattern matchi
 
 ## Commands
 ```bash
-pytest --cov=invictus_signals --cov-fail-under=90
+pip install -e ".[dev]"                              # install with dev deps
+pytest --cov=invictus_signals --cov-fail-under=90   # run tests (90% floor)
 ```
 
 ## Key Files
@@ -31,6 +32,7 @@ pytest --cov=invictus_signals --cov-fail-under=90
 - `invictus_signals/event_calendar.py` — FOMC, CPI, NFP, halving dates
 - `invictus_signals/candle_patterns.py` — Hammer, Doji, Engulfing
 - `invictus_signals/patterns/base.py` — PatternDetector ABC
+- `tests/` — one test file per module, `conftest.py` with shared candle fixtures
 
 ## Git Workflow
 - NEVER commit to `main` — always feature branch → PR → merge
