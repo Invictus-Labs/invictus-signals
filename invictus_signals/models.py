@@ -147,6 +147,12 @@ class TAState:
     adx: float = 0.0
     atr: float = 0.0
     atr_pct: float = 0.0
+    # Intraday structure (from the intraday candles arg of compute_ta_state).
+    # Defaults are sentinel "no intraday data": consumers that gate on these
+    # (e.g. dnt_09's recovery release) must treat 0.0 as absent and fall back
+    # to daily-only behavior, so TAStates built without them are unchanged.
+    intraday_ma_fast: float = 0.0
+    intraday_close_slope: float = 0.0
 
 
 @dataclass

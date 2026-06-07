@@ -306,7 +306,16 @@ def dnt_09_buying_downtrend(
 ) -> DNTResult:
     """DNT 09: Do not buy in a downtrend / catch falling knives.
 
-    Triggered when LONG but fast MA is sloping down AND price is below mid MA.
+    Daily knife: fast (daily) slope is negative AND price is below the daily
+    mid MA. That condition alone holds for days-to-weeks after a multi-day
+    dump — long after the knife has stopped falling — so it is released when
+    the intraday structure has demonstrably turned: price above the intraday
+    fast MA with a positive intraday close slope (2026-06-06/07 incident:
+    530 consecutive LONG blocks across BTC/ETH/SOL/BNB through a V-recovery
+    that was already above every 1h MA).
+
+    A TAState without intraday data (intraday_ma_fast == 0.0 sentinel) keeps
+    the original daily-only behavior — the release never applies.
     """
     if intended_direction != Direction.LONG:
         return _make_result(
@@ -316,17 +325,34 @@ def dnt_09_buying_downtrend(
             "Not a long trade — filter not applicable",
             11.1,
         )
-    triggered = ta.ma_fast_slope < 0 and current_price < ta.ma_mid
+    daily_knife = ta.ma_fast_slope < 0 and current_price < ta.ma_mid
+    intraday_recovery = (
+        ta.intraday_ma_fast > 0.0
+        and current_price > ta.intraday_ma_fast
+        and ta.intraday_close_slope > 0
+    )
+    triggered = daily_knife and not intraday_recovery
+    if triggered:
+        detail = (
+            f"Fast slope={ta.ma_fast_slope:.4f} < 0 AND price={current_price:.4f} "
+            f"< mid MA={ta.ma_mid:.4f} — falling knife (no intraday recovery: "
+            f"intraday MA={ta.intraday_ma_fast:.4f}, "
+            f"intraday slope={ta.intraday_close_slope:.4f})"
+        )
+    elif daily_knife:
+        detail = (
+            f"Daily downtrend (slope={ta.ma_fast_slope:.4f}, "
+            f"price={current_price:.4f} < mid MA={ta.ma_mid:.4f}) RELEASED by "
+            f"intraday recovery: price > intraday MA={ta.intraday_ma_fast:.4f} "
+            f"AND intraday slope={ta.intraday_close_slope:.4f} > 0"
+        )
+    else:
+        detail = "No downtrend knife catch detected"
     return _make_result(
         "dnt_09_buying_downtrend",
         "Do Not Buy in Downtrend / Catch Falling Knife",
         triggered,
-        (
-            f"Fast slope={ta.ma_fast_slope:.4f} < 0 AND price={current_price:.4f} "
-            f"< mid MA={ta.ma_mid:.4f} — falling knife"
-            if triggered
-            else "No downtrend knife catch detected"
-        ),
+        detail,
         11.1,
     )
 

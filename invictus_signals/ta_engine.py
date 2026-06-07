@@ -357,6 +357,25 @@ def compute_ta_state(
     else:
         bb_upper_slope = 0.0
 
+    # --- Intraday structure (same fast period as the daily MA, applied to the
+    # intraday bars — e.g. ma_fast_period=12 on 1h candles = 12-hour SMA; slope
+    # is the OLS slope of the last 5 intraday closes).
+    # Gives daily-scale filters (dnt_09) a current-session lens: a multi-day
+    # dump keeps the daily 5-day slope negative for days and price below the
+    # 26-day SMA for weeks, long after the intraday structure has reversed
+    # (observed 2026-06-06/07: 530 dnt_09 blocks across BTC/ETH/SOL/BNB
+    # through an intraday V-recovery).
+    intraday_closes = [c.close for c in candles]
+    n_intraday = len(intraday_closes)
+    intraday_ma_fast = calculate_sma(
+        intraday_closes, min(cfg.ma_fast_period, n_intraday)
+    )
+    intraday_slope_period = min(5, n_intraday)
+    if intraday_slope_period >= 2:
+        intraday_close_slope = calculate_slope(intraday_closes, intraday_slope_period)
+    else:
+        intraday_close_slope = 0.0
+
     # --- Volume MA (intraday) ---
     vol_period = min(cfg.volume_ma_period, len(intraday_volumes))
     volume_ma = calculate_sma(intraday_volumes, vol_period)
@@ -389,4 +408,6 @@ def compute_ta_state(
         atr=atr_val,
         atr_pct=atr_pct,
         adx=adx,
+        intraday_ma_fast=intraday_ma_fast,
+        intraday_close_slope=intraday_close_slope,
     )
