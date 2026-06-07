@@ -40,12 +40,16 @@ def make_ta(
     bb_upper: float = 105.0,
     bb_lower: float = 95.0,
     bb_middle: float = 100.0,
+    intraday_ma_fast: float = 0.0,
+    intraday_close_slope: float = 0.0,
 ) -> TAState:
     return TAState(
         ma_fast=ma_fast, ma_mid=ma_mid, ma_slow=90.0,
         ma_fast_slope=ma_fast_slope, ma_mid_slope=0.0,
         bb_upper=bb_upper, bb_lower=bb_lower, bb_middle=bb_middle,
         bb_width=0.1, bb_upper_slope=0.0, volume_ma=1000.0, vwap=100.0,
+        intraday_ma_fast=intraday_ma_fast,
+        intraday_close_slope=intraday_close_slope,
     )
 
 
@@ -234,6 +238,56 @@ class TestDNT09:
         ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
         result = dnt_09_buying_downtrend(ta, current_price=100.0, intended_direction=Direction.LONG)
         assert result.triggered is False
+
+    def test_daily_knife_released_by_intraday_recovery(self) -> None:
+        # Regression: 2026-06-06/07 — 530 consecutive LONG blocks on
+        # BTC/ETH/SOL/BNB through an intraday V-recovery. Daily slope stays
+        # negative ~5 days and price sits below the 26d SMA for weeks after a
+        # multi-day dump; the release must come from intraday structure.
+        # Values from the live BTC block at 2026-06-07 14:09 UTC.
+        ta = make_ta(
+            ma_mid=73294.87, ma_fast_slope=-787.52,
+            intraday_ma_fast=61300.0, intraday_close_slope=180.0,
+        )
+        result = dnt_09_buying_downtrend(
+            ta, current_price=61705.81, intended_direction=Direction.LONG
+        )
+        assert result.triggered is False
+        assert "RELEASED" in result.reason
+
+    def test_daily_knife_still_triggers_when_intraday_falling(self) -> None:
+        # The actual knife: intraday also falling — no release.
+        ta = make_ta(
+            ma_mid=105.0, ma_fast_slope=-0.5,
+            intraday_ma_fast=102.0, intraday_close_slope=-0.5,
+        )
+        result = dnt_09_buying_downtrend(ta, current_price=100.0, intended_direction=Direction.LONG)
+        assert result.triggered is True
+        assert "falling knife" in result.reason
+
+    def test_no_release_when_price_above_intraday_ma_but_slope_flat(self) -> None:
+        # Both legs of the release are required: slope must be strictly > 0.
+        ta = make_ta(
+            ma_mid=105.0, ma_fast_slope=-0.5,
+            intraday_ma_fast=98.0, intraday_close_slope=0.0,
+        )
+        result = dnt_09_buying_downtrend(ta, current_price=100.0, intended_direction=Direction.LONG)
+        assert result.triggered is True
+
+    def test_no_release_when_slope_up_but_price_below_intraday_ma(self) -> None:
+        ta = make_ta(
+            ma_mid=105.0, ma_fast_slope=-0.5,
+            intraday_ma_fast=102.0, intraday_close_slope=0.5,
+        )
+        result = dnt_09_buying_downtrend(ta, current_price=100.0, intended_direction=Direction.LONG)
+        assert result.triggered is True
+
+    def test_backward_compat_without_intraday_data(self) -> None:
+        # TAState built without intraday fields (0.0 sentinel) keeps the
+        # original daily-only behavior — the release never applies.
+        ta = make_ta(ma_mid=105.0, ma_fast_slope=-0.5)
+        result = dnt_09_buying_downtrend(ta, current_price=100.0, intended_direction=Direction.LONG)
+        assert result.triggered is True
 
 
 class TestDNT10:

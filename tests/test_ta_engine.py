@@ -282,6 +282,28 @@ class TestComputeTAState:
         ta = compute_ta_state(intraday, daily)
         assert ta.ma_fast > 0  # Defaults to SPY without error
 
+    def test_intraday_fields_populated(self) -> None:
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        # 10 rising intraday closes 100..109: BTC fast period 12 capped at
+        # n=10 -> SMA = 104.5; OLS slope of last 5 closes = exactly 1.0.
+        intraday = make_candles([100.0 + i for i in range(10)])
+        ta = compute_ta_state(intraday, daily, config=get_config("BTC"))
+        assert ta.intraday_ma_fast == pytest.approx(104.5)
+        assert ta.intraday_close_slope == pytest.approx(1.0)
+
+    def test_intraday_slope_negative_on_falling_session(self) -> None:
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday = make_candles([110.0 - i for i in range(10)])
+        ta = compute_ta_state(intraday, daily, config=get_config("BTC"))
+        assert ta.intraday_close_slope == pytest.approx(-1.0)
+
+    def test_intraday_slope_zero_with_single_candle(self) -> None:
+        daily = make_candles([500.0] * 25)
+        intraday = make_candles([500.0])
+        ta = compute_ta_state(intraday, daily)
+        assert ta.intraday_close_slope == 0.0
+        assert ta.intraday_ma_fast == pytest.approx(500.0)
+
     def test_raises_empty_candles(self) -> None:
         daily = make_candles([500.0] * 25)
         with pytest.raises(ValueError, match="candles must not be empty"):
