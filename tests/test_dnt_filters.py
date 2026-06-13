@@ -28,6 +28,7 @@ from invictus_signals.models import (
     Direction,
     LineColor,
     LineType,
+    RegimeClass,
     TAState,
 )
 from tests.conftest import make_candle, make_candles
@@ -167,6 +168,70 @@ class TestDNT06:
         ta = make_ta(ma_fast_slope=-0.5)
         result = dnt_06_no_short_uptrend(ta, Direction.SHORT)
         assert result.triggered is False
+
+    def test_triggers_when_shorting_bullish_regime_flat_slope(self) -> None:
+        # The leak: regime is BULLISH (price/MA structure up) but the 5-bar
+        # close slope is flat/negative on a pullback. Slope-only gate missed it;
+        # regime-aware gate now blocks the short. (2026-06-13 HYPE b7 regression.)
+        ta = make_ta(ma_fast_slope=-0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+        assert "BULLISH" in result.reason
+
+    def test_zero_slope_bullish_regime_triggers(self) -> None:
+        ta = make_ta(ma_fast_slope=0.0)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+
+    def test_not_triggered_shorting_bearish_regime(self) -> None:
+        # Legit downtrend short must still fire — regime not bullish, slope down.
+        ta = make_ta(ma_fast_slope=-0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BEARISH)
+        assert result.triggered is False
+
+    def test_slope_up_triggers_regardless_of_regime(self) -> None:
+        ta = make_ta(ma_fast_slope=0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BEARISH)
+        assert result.triggered is True
+
+    def test_backcompat_no_regime_arg_is_slope_only(self) -> None:
+        # Omitting regime_class preserves the original slope-only behaviour.
+        ta = make_ta(ma_fast_slope=-0.5)
+        assert dnt_06_no_short_uptrend(ta, Direction.SHORT).triggered is False
+        ta_up = make_ta(ma_fast_slope=0.5)
+        assert dnt_06_no_short_uptrend(ta_up, Direction.SHORT).triggered is True
+
+    def test_long_not_applicable_even_in_bullish(self) -> None:
+        ta = make_ta(ma_fast_slope=0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.LONG, RegimeClass.BULLISH)
+        assert result.triggered is False
+
+    def test_not_triggered_in_choppy_regime(self) -> None:
+        # CHOPPY is not a confirmed uptrend — shorts allowed (enum-coverage guard:
+        # the BULLISH equality check is the whole safety mechanism).
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.CHOPPY)
+        assert result.triggered is False
+
+    def test_not_triggered_in_transition_regime(self) -> None:
+        # TRANSITION (incl. bullish-leaning T3/T8) is NOT classed BULLISH, so a
+        # flat-slope short still passes. Documents the current scope boundary.
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.TRANSITION)
+        assert result.triggered is False
+
+    def test_zero_slope_bullish_takes_regime_branch(self) -> None:
+        ta = make_ta(ma_fast_slope=0.0)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+        assert "BULLISH" in result.reason
+
+    def test_slope_up_branch_precedence_over_regime(self) -> None:
+        # Both truthy: slope branch wins, reason cites slope (not regime).
+        ta = make_ta(ma_fast_slope=0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+        assert "slope" in result.reason
 
 
 class TestDNT07:
@@ -424,6 +489,22 @@ class TestRunUniversalDNTFilters:
         assert "dnt_04_inside_wedge" in filter_ids
         assert "dnt_07_chasing_missed_entry" in filter_ids
         assert "dnt_17_risk_undefined" in filter_ids
+
+    def test_dnt_06_blocks_short_in_bullish_regime_via_dispatcher(
+        self, spy_candles_bullish, two_good_lines, regime_bullish
+    ) -> None:
+        """Regression (2026-06-13 HYPE b7 leak): a SHORT in a BULLISH regime
+        with a flat/negative slope is gated through the dispatcher, even though
+        the slope-only check alone would have let it through."""
+        ta = make_ta(ma_fast_slope=-0.5)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish, two_good_lines, regime_bullish, ta, 0,
+            intended_direction=Direction.SHORT,
+        )
+        dnt06 = next(
+            r for r in results if r.filter_id == "dnt_06_no_short_uptrend"
+        )
+        assert dnt06.triggered is True
 
     def test_btc_config_uses_correct_thresholds(
         self, two_good_lines, regime_bullish
