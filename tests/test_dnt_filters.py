@@ -206,6 +206,33 @@ class TestDNT06:
         result = dnt_06_no_short_uptrend(ta, Direction.LONG, RegimeClass.BULLISH)
         assert result.triggered is False
 
+    def test_not_triggered_in_choppy_regime(self) -> None:
+        # CHOPPY is not a confirmed uptrend — shorts allowed (enum-coverage guard:
+        # the BULLISH equality check is the whole safety mechanism).
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.CHOPPY)
+        assert result.triggered is False
+
+    def test_not_triggered_in_transition_regime(self) -> None:
+        # TRANSITION (incl. bullish-leaning T3/T8) is NOT classed BULLISH, so a
+        # flat-slope short still passes. Documents the current scope boundary.
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.TRANSITION)
+        assert result.triggered is False
+
+    def test_zero_slope_bullish_takes_regime_branch(self) -> None:
+        ta = make_ta(ma_fast_slope=0.0)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+        assert "BULLISH" in result.reason
+
+    def test_slope_up_branch_precedence_over_regime(self) -> None:
+        # Both truthy: slope branch wins, reason cites slope (not regime).
+        ta = make_ta(ma_fast_slope=0.5)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.BULLISH)
+        assert result.triggered is True
+        assert "slope" in result.reason
+
 
 class TestDNT07:
     def test_triggers_when_chasing(self) -> None:
