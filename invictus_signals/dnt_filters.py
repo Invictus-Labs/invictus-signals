@@ -17,6 +17,7 @@ from invictus_signals.models import (
     Candle,
     DNTResult,
     Direction,
+    RegimeClass,
     RegimeClassification,
     TAState,
 )
@@ -214,10 +215,22 @@ def dnt_05_trapped_between_mas(
 def dnt_06_no_short_uptrend(
     ta: TAState,
     intended_direction: Direction,
+    regime_class: RegimeClass | None = None,
 ) -> DNTResult:
     """DNT 06: Do not short in an active uptrend.
 
-    Triggered when intended direction is SHORT but fast MA slope > 0.
+    Triggered when intended direction is SHORT and EITHER the fast MA slope is
+    positive OR the regime classifier has labelled the market BULLISH.
+
+    The slope test alone diverges from the regime definition of "uptrend": a
+    pullback inside a confirmed uptrend (e.g. the b7 higher-low-defense regime,
+    where price > mid MA and fast MA > mid MA) has a flat-or-negative 5-bar
+    close slope while still being BULLISH. The slope-only gate let those shorts
+    through and they were run over (2026-06-13 HYPE SD short, regime
+    b7_hl_defense, -$17.29). Honouring the regime label closes that divergence
+    so the gate actually does what its name says. ``regime_class`` is optional
+    (defaults to None) to preserve back-compat for callers that only pass the
+    TAState; when None the original slope-only behaviour applies.
     """
     if intended_direction != Direction.SHORT:
         return _make_result(
@@ -227,16 +240,28 @@ def dnt_06_no_short_uptrend(
             "Not a short trade — filter not applicable",
             14.9,
         )
-    triggered = ta.ma_fast_slope > 0
+    slope_up = ta.ma_fast_slope > 0
+    bullish_regime = regime_class == RegimeClass.BULLISH
+    triggered = slope_up or bullish_regime
+    if slope_up:
+        detail = (
+            f"Fast MA slope={ta.ma_fast_slope:.4f} > 0 — uptrend intact, no shorting"
+        )
+    elif bullish_regime:
+        detail = (
+            f"Regime BULLISH (price/MA structure up) with flat slope "
+            f"({ta.ma_fast_slope:.4f}) — no shorting into a confirmed uptrend"
+        )
+    else:
+        detail = (
+            f"Fast MA slope={ta.ma_fast_slope:.4f} <= 0 and regime not bullish "
+            f"— shorting allowed"
+        )
     return _make_result(
         "dnt_06_no_short_uptrend",
         "Do Not Short in Active Uptrend",
         triggered,
-        (
-            f"Fast MA slope={ta.ma_fast_slope:.4f} > 0 — uptrend intact, no shorting"
-            if triggered
-            else f"Fast MA slope={ta.ma_fast_slope:.4f} <= 0 — shorting allowed"
-        ),
+        detail,
         14.9,
     )
 
@@ -588,7 +613,9 @@ def run_universal_dnt_filters(
         results.append(dnt_04_inside_wedge(candles, wedge_upper, wedge_lower))
 
     results.append(dnt_05_trapped_between_mas(current_price, ta_state))
-    results.append(dnt_06_no_short_uptrend(ta_state, intended_direction))
+    results.append(
+        dnt_06_no_short_uptrend(ta_state, intended_direction, regime.regime_class)
+    )
 
     if trigger_level is not None:
         results.append(
