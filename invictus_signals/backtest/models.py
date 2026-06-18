@@ -45,10 +45,19 @@ class RegimePatternKey:
 
 @dataclass
 class AggregateStats:
-    """Aggregated trade statistics for a symbol or (pattern, regime) bucket."""
+    """Aggregated trade statistics for a symbol or (pattern, regime) bucket.
+
+    Win/loss/break-even contract (matches the live /performance matrix):
+      - win:        net r_multiple > 0  (positive after fees)
+      - loss:       net r_multiple < 0  (negative after fees)
+      - break_even: net r_multiple == 0 (rare; fee-eroded stop exits can land here)
+
+    All three are counted independently; ``trades == wins + losses + break_even``.
+    """
     trades: int = 0
     wins: int = 0
     losses: int = 0
+    break_even: int = 0
     total_r: Decimal = field(default_factory=lambda: Decimal(0))
     total_fees: Decimal = field(default_factory=lambda: Decimal(0))
 
@@ -80,18 +89,27 @@ class BacktestReport:
     all_trades: list[TradeResult] = field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
-        """Compact summary dict suitable for logging or test assertions."""
+        """Compact summary dict suitable for logging or test assertions.
+
+        Win/loss/break_even contract mirrors AggregateStats:
+          win = net r_multiple > 0, loss = r_multiple < 0, break_even = r_multiple == 0.
+        """
         total = AggregateStats()
         for t in self.all_trades:
             total.trades += 1
             if t.r_multiple > Decimal(0):
                 total.wins += 1
-            else:
+            elif t.r_multiple < Decimal(0):
                 total.losses += 1
+            else:
+                total.break_even += 1
             total.total_r += t.r_multiple
             total.total_fees += t.fees_paid
         return {
             "total_trades": total.trades,
+            "wins": total.wins,
+            "losses": total.losses,
+            "break_even": total.break_even,
             "win_rate": float(total.win_rate),
             "avg_r": float(total.avg_r),
             "total_r": float(total.total_r),

@@ -681,3 +681,106 @@ class TestDNT09BiasCoupling:
             regime_bias=None,
         )
         assert result.triggered is False
+
+
+# ---------------------------------------------------------------------------
+# P1 DISPATCHER regression: run_universal_dnt_filters must thread regime.bias
+# (These tests call via the aggregator — the path the bot actually uses.)
+# ---------------------------------------------------------------------------
+
+class TestDispatcherBiasCoupling:
+    """Regression: E4 bias coupling was dead in production because
+    run_universal_dnt_filters was not forwarding regime.bias to dnt_06/09.
+    These tests exercise the full aggregator path, NOT the filter directly."""
+
+    def test_dnt06_transition_long_bias_triggers_via_dispatcher(
+        self, spy_candles_bullish, two_good_lines
+    ) -> None:
+        """TRANSITION regime + bias=LONG + SHORT direction → dnt_06 must trigger
+        through the dispatcher.  Fails if aggregator omits regime_bias=."""
+        from invictus_signals.models import RegimeId, RegimeClassification
+        ta = make_ta(ma_fast_slope=-0.1)
+        regime = RegimeClassification(
+            regime_id=RegimeId.T3_BULL_REVERSAL,
+            regime_class=RegimeClass.TRANSITION,
+            bias=Direction.LONG,
+            size_multiplier=0.75,
+            conditions_met=["golden cross forming"],
+            confidence=0.70,
+        )
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.SHORT,
+        )
+        dnt06 = next(r for r in results if r.filter_id == "dnt_06_no_short_uptrend")
+        assert dnt06.triggered is True, (
+            "E4 P1: dnt_06 must block shorts in T3/T8 TRANSITION+LONG-bias "
+            "via the aggregator — bias was not threaded"
+        )
+
+    def test_dnt09_transition_short_bias_triggers_via_dispatcher(
+        self, spy_candles_bullish, two_good_lines
+    ) -> None:
+        """TRANSITION regime + bias=SHORT + LONG direction → dnt_09 must trigger
+        through the dispatcher.  Fails if aggregator omits regime_class/bias."""
+        from invictus_signals.models import RegimeId, RegimeClassification
+        # Daily conditions: no knife (slope positive, price above mid) so the
+        # only trigger here is the TRANSITION+SHORT bias path.
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        regime = RegimeClassification(
+            regime_id=RegimeId.T6_HL_BREACH,
+            regime_class=RegimeClass.TRANSITION,
+            bias=Direction.SHORT,
+            size_multiplier=0.5,
+            conditions_met=["price < mid MA", "fast slope < 0"],
+            confidence=0.60,
+        )
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.LONG,
+        )
+        dnt09 = next(r for r in results if r.filter_id == "dnt_09_buying_downtrend")
+        assert dnt09.triggered is True, (
+            "E4 P1: dnt_09 must block longs in T5/T6 TRANSITION+SHORT-bias "
+            "via the aggregator — regime_class/bias were not threaded"
+        )
+
+    def test_dnt06_choppy_bias_none_does_not_block_short(
+        self, spy_candles_bullish, two_good_lines, regime_choppy
+    ) -> None:
+        """CHOPPY regime has bias=None — dnt_06 must NOT trigger on flat slope."""
+        ta = make_ta(ma_fast_slope=-0.1)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime_choppy,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.SHORT,
+        )
+        dnt06 = next(r for r in results if r.filter_id == "dnt_06_no_short_uptrend")
+        assert dnt06.triggered is False
+
+    def test_dnt09_choppy_bias_none_does_not_block_long(
+        self, spy_candles_bullish, two_good_lines, regime_choppy
+    ) -> None:
+        """CHOPPY regime has bias=None — dnt_09 must NOT trigger when no daily knife."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime_choppy,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.LONG,
+        )
+        dnt09 = next(r for r in results if r.filter_id == "dnt_09_buying_downtrend")
+        assert dnt09.triggered is False

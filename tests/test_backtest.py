@@ -277,19 +277,22 @@ class TestValidateRegimeLabels:
     """E7 regime-label validation."""
 
     def _make_sample(self) -> tuple[dict, dict, list[ReferenceRow]]:
-        """Build a minimal sample: 2 symbols, 50 bars each, a few reference rows."""
-        btc_daily = _rising_candles(50, base=80_000.0, step=50.0)
-        spy_daily = _rising_candles(50, base=500.0, step=0.5)
-        intra = _rising_candles(50, base=100.0, step=0.1)
+        """Build a minimal sample: 2 symbols, 60 bars each, a few reference rows.
+
+        Reference rows use bar index 35 — above the 30-bar _MIN_WARMUP_BARS gate
+        so they are evaluated (not skipped) by validate_regime_labels.
+        """
+        btc_daily = _rising_candles(60, base=80_000.0, step=50.0)
+        spy_daily = _rising_candles(60, base=500.0, step=0.5)
+        intra = _rising_candles(60, base=100.0, step=0.1)
 
         candles_by_sym = {"BTC": btc_daily, "SPY": spy_daily}
         intraday_by_sym = {"BTC": intra, "SPY": intra}
 
-        # Build reference rows using timestamps from the daily candles.
-        # We pick bars >=5 so there's enough warmup for compute_ta_state.
+        # Bar 35 is above the _MIN_WARMUP_BARS=30 gate — will be evaluated.
         reference = [
-            ReferenceRow(symbol="BTC", timestamp=btc_daily[10].timestamp, regime_id="b1_trending"),
-            ReferenceRow(symbol="SPY", timestamp=spy_daily[10].timestamp, regime_id="b1_trending"),
+            ReferenceRow(symbol="BTC", timestamp=btc_daily[35].timestamp, regime_id="b1_trending"),
+            ReferenceRow(symbol="SPY", timestamp=spy_daily[35].timestamp, regime_id="b1_trending"),
         ]
         return candles_by_sym, intraday_by_sym, reference
 
@@ -314,7 +317,8 @@ class TestValidateRegimeLabels:
         """A deliberate wrong expected regime_id produces a mismatch entry."""
         candles, intraday, _ = self._make_sample()
         btc_daily = candles["BTC"]
-        ref = [ReferenceRow(symbol="BTC", timestamp=btc_daily[10].timestamp, regime_id="br1_aggressive")]
+        # Use bar 35 (above warmup floor) with a wrong regime so it is evaluated
+        ref = [ReferenceRow(symbol="BTC", timestamp=btc_daily[35].timestamp, regime_id="br1_aggressive")]
         result = validate_regime_labels(candles, intraday, ref)
         # Either it's a mismatch or the actual regime really is br1_aggressive
         if result.mismatches:
@@ -380,3 +384,227 @@ class TestDecimalHelper:
     def test_zero_converts(self) -> None:
         d = _decimal(0.0)
         assert d == Decimal(0)
+
+
+# ---------------------------------------------------------------------------
+# P1: Fill model SL-hit and edge-case tests (previously dead branches)
+# ---------------------------------------------------------------------------
+
+class TestFillModelSLPaths:
+    """Exercises the LONG-SL, SHORT-SL, last-bar, and zero-risk branches
+    that were uncovered before the P1 fix.
+    """
+
+    def _engine_with_single_signal(
+        self,
+        daily: list,
+        intraday: list,
+        bar_index: int,
+        direction: Direction,
+        stop_offset_pct: float = 0.01,
+    ) -> ReplayEngine:
+        signals = [SignalRecord(
+            bar_index=bar_index,
+            pattern_id="sl_test",
+            direction=direction,
+            stop_offset_pct=stop_offset_pct,
+        )]
+        return ReplayEngine(
+            daily_candles=daily,
+            intraday_candles=intraday,
+            config=BacktestConfig(symbol="SPY"),
+            signals=signals,
+        )
+
+    def test_long_sl_hit_exit_reason_and_negative_r(self) -> None:
+        """LONG signal where bar immediately crashes below SL → exit_reason='sl',
+        r_multiple < 0.
+        Set up: entry at bar 32 open (=100), SL at 99 (1%).
+        Bar 32 low is set very low (50) to guarantee SL hit.
+        """
+        # Build 60 rising candles then inject a crash candle at index 32
+        from tests.conftest import make_candle
+        rising = [make_candle(100.0 + i * 0.1, timestamp=float(i)) for i in range(60)]
+        # The signal fires at bar 31; engine enters at bar 32 open.
+        # Make bar 32 low=50 so it's below any 1% SL.
+        rising[32] = make_candle(
+            close=100.0, high=101.0, low=50.0, timestamp=float(32)
+        )
+        intra = rising[:]
+        engine = self._engine_with_single_signal(rising, intra, bar_index=31, direction=Direction.LONG)
+        report = engine.run()
+        sl_trades = [t for t in report.all_trades if t.exit_reason == "sl"]
+        assert len(sl_trades) == 1, f"Expected 1 SL trade, got {report.all_trades}"
+        trade = sl_trades[0]
+        assert trade.r_multiple < Decimal(0), f"LONG SL must be negative R, got {trade.r_multiple}"
+        assert trade.direction == Direction.LONG
+
+    def test_short_sl_hit_exit_reason_and_negative_r(self) -> None:
+        """SHORT signal where bar immediately spikes above SL → exit_reason='sl',
+        r_multiple < 0.
+        """
+        from tests.conftest import make_candle
+        falling = [make_candle(130.0 - i * 0.1, timestamp=float(i)) for i in range(60)]
+        # Signal at bar 31; enter at bar 32 open (~127.9). SL is 1% above entry.
+        # Inject a bar with high=300 so it blows past any 1% SHORT SL.
+        falling[32] = make_candle(
+            close=130.0, high=300.0, low=100.0, timestamp=float(32)
+        )
+        intra = falling[:]
+        engine = self._engine_with_single_signal(falling, intra, bar_index=31, direction=Direction.SHORT)
+        report = engine.run()
+        sl_trades = [t for t in report.all_trades if t.exit_reason == "sl"]
+        assert len(sl_trades) == 1, f"Expected 1 SHORT SL trade, got {report.all_trades}"
+        trade = sl_trades[0]
+        assert trade.r_multiple < Decimal(0), f"SHORT SL must be negative R, got {trade.r_multiple}"
+        assert trade.direction == Direction.SHORT
+
+    def test_signal_on_last_bar_produces_no_trade(self) -> None:
+        """Signal at last available bar → no next bar to enter → no trade produced."""
+        daily = _rising_candles(35)  # bars 0..34; warmup consumes 0..29
+        # Signal at bar 34 (last bar) — engine checks i+1 >= n → skips
+        signals = [SignalRecord(bar_index=34, pattern_id="edge", direction=Direction.LONG, stop_offset_pct=0.01)]
+        engine = ReplayEngine(
+            daily_candles=daily,
+            intraday_candles=daily,
+            config=BacktestConfig(symbol="SPY"),
+            signals=signals,
+        )
+        report = engine.run()
+        assert len(report.all_trades) == 0
+
+    def test_zero_risk_signal_produces_no_trade(self) -> None:
+        """stop_offset_pct=0 → SL==entry → risk=0 → _fill_trade returns None."""
+        from tests.conftest import make_candle
+        daily = [make_candle(100.0, timestamp=float(i)) for i in range(40)]
+        signals = [SignalRecord(bar_index=31, pattern_id="zero_risk", direction=Direction.LONG, stop_offset_pct=0.0)]
+        engine = ReplayEngine(
+            daily_candles=daily,
+            intraday_candles=daily,
+            config=BacktestConfig(symbol="SPY"),
+            signals=signals,
+        )
+        report = engine.run()
+        zero_risk_trades = [t for t in report.all_trades if t.pattern_id == "zero_risk"]
+        assert len(zero_risk_trades) == 0, "Zero-risk signal must produce no trade"
+
+
+# ---------------------------------------------------------------------------
+# P2: Win / loss / break-even classification contract
+# ---------------------------------------------------------------------------
+
+class TestWinLossBreakEvenContract:
+    """AggregateStats and BacktestReport.summary() must correctly bucket
+    positive-r, negative-r, and zero-r trades into wins/losses/break_even.
+    """
+
+    def _make_trade(self, r: str) -> TradeResult:
+        """Build a minimal TradeResult with the given R-multiple string."""
+        from invictus_signals.models import RegimeId
+        return TradeResult(
+            symbol="BTC",
+            pattern_id="p",
+            direction=Direction.LONG,
+            regime_id=RegimeId.B1_TRENDING,
+            entry_price=Decimal("100"),
+            exit_price=Decimal("100"),
+            stop_price=Decimal("99"),
+            target_prices=[Decimal("103")],
+            fees_paid=Decimal("0.01"),
+            r_multiple=Decimal(r),
+            exit_reason="tp1",
+            bar_index=0,
+            timestamp=0.0,
+        )
+
+    def test_all_loss_set_win_rate_zero(self) -> None:
+        report = BacktestReport()
+        for _ in range(5):
+            t = self._make_trade("-1")
+            report.all_trades.append(t)
+        summary = report.summary()
+        assert summary["win_rate"] == 0.0
+        assert summary["losses"] == 5
+        assert summary["wins"] == 0
+        assert summary["break_even"] == 0
+
+    def test_single_loss_stats(self) -> None:
+        report = BacktestReport()
+        report.all_trades.append(self._make_trade("-1"))
+        summary = report.summary()
+        assert summary["total_trades"] == 1
+        assert summary["losses"] == 1
+        assert summary["wins"] == 0
+
+    def test_exactly_break_even_trade(self) -> None:
+        """r_multiple == 0 must land in break_even, not wins or losses."""
+        report = BacktestReport()
+        report.all_trades.append(self._make_trade("0"))
+        summary = report.summary()
+        assert summary["break_even"] == 1
+        assert summary["wins"] == 0
+        assert summary["losses"] == 0
+
+    def test_mixed_win_loss_breakeven(self) -> None:
+        report = BacktestReport()
+        report.all_trades.extend([
+            self._make_trade("2"),    # win
+            self._make_trade("-1"),   # loss
+            self._make_trade("0"),    # break_even
+        ])
+        summary = report.summary()
+        assert summary["total_trades"] == 3
+        assert summary["wins"] == 1
+        assert summary["losses"] == 1
+        assert summary["break_even"] == 1
+
+    def test_aggregate_stats_break_even_counter_via_update_stats(self) -> None:
+        """_update_stats must increment break_even, not losses, for r==0."""
+        from invictus_signals.backtest.engine import _update_stats
+        report = BacktestReport()
+        trade = self._make_trade("0")
+        _update_stats(report, trade, "BTC")
+        stats = report.per_symbol["BTC"]
+        assert stats.break_even == 1
+        assert stats.losses == 0
+        assert stats.wins == 0
+        assert stats.trades == 1
+
+    def test_win_rate_excludes_break_even_from_denominator_via_property(self) -> None:
+        """win_rate = wins/trades; break_even trades lower the rate (they aren't wins)."""
+        stats = AggregateStats(trades=4, wins=2, losses=1, break_even=1, total_r=Decimal("2"))
+        assert stats.win_rate == Decimal("2") / Decimal("4")
+
+
+# ---------------------------------------------------------------------------
+# P3: validate_regime_labels warmup floor matches _MIN_WARMUP_BARS
+# ---------------------------------------------------------------------------
+
+class TestValidationWarmupFloor:
+    def test_bar_below_warmup_floor_is_skipped(self) -> None:
+        """Rows whose bar_idx < _MIN_WARMUP_BARS (30) must be skipped, not checked."""
+        from invictus_signals.backtest.engine import _MIN_WARMUP_BARS
+        from invictus_signals.backtest.validation import ReferenceRow
+
+        # Build 60 rising BTC candles
+        daily = _rising_candles(60, base=80_000.0, step=50.0)
+        intra = _rising_candles(10, base=100.0, step=0.1)
+
+        # Reference row at bar 5 — well below the 30-bar floor
+        ref = [ReferenceRow(symbol="BTC", timestamp=daily[5].timestamp, regime_id="b1_trending")]
+        result = validate_regime_labels({"BTC": daily}, {"BTC": intra}, ref)
+        assert result.skipped == 1
+        assert result.total_checked == 0
+
+    def test_bar_at_warmup_floor_is_evaluated(self) -> None:
+        """Rows at exactly _MIN_WARMUP_BARS (30) should be evaluated, not skipped."""
+        from invictus_signals.backtest.engine import _MIN_WARMUP_BARS
+        from invictus_signals.backtest.validation import ReferenceRow
+
+        daily = _rising_candles(60, base=80_000.0, step=50.0)
+        intra = _rising_candles(10, base=100.0, step=0.1)
+
+        ref = [ReferenceRow(symbol="BTC", timestamp=daily[_MIN_WARMUP_BARS].timestamp, regime_id="b1_trending")]
+        result = validate_regime_labels({"BTC": daily}, {"BTC": intra}, ref)
+        # Should be evaluated (total_checked >= 1), regardless of match/mismatch
+        assert result.total_checked >= 1

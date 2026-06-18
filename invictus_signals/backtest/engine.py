@@ -132,7 +132,6 @@ def _fill_trade(
     fee_rate: Decimal,
     symbol: str,
     pattern_id: str,
-    regime_id_val: str,
     timestamp: float,
     regime_classification: RegimeClassification,
 ) -> Optional[TradeResult]:
@@ -141,7 +140,6 @@ def _fill_trade(
     Returns None if ``start_idx`` is out of range (insufficient bars after
     the signal — caller skips gracefully).
     """
-    from invictus_signals.models import RegimeId
     if start_idx >= len(bars):
         return None
 
@@ -160,8 +158,7 @@ def _fill_trade(
             # Check SL first (conservative)
             if bar_low <= sl:
                 exit_price = sl
-                r = (exit_price - entry - risk) / risk  # = -1 net of 0 fee move
-                r = (exit_price - entry) / risk
+                r = (exit_price - entry) / risk  # negative: sl < entry for LONG
                 fees = (entry + exit_price) * fee_rate
                 return TradeResult(
                     symbol=symbol,
@@ -266,21 +263,31 @@ def _fill_trade(
     )
 
 
+def _classify_outcome(r: Decimal) -> tuple[int, int, int]:
+    """Return (wins, losses, break_even) increments for a single trade R."""
+    if r > Decimal(0):
+        return (1, 0, 0)
+    if r < Decimal(0):
+        return (0, 1, 0)
+    return (0, 0, 1)
+
+
 def _update_stats(
     report: BacktestReport,
     trade: TradeResult,
     symbol: str,
 ) -> None:
     """Mutate ``report`` in-place to record a trade."""
+    w, l, b = _classify_outcome(trade.r_multiple)
+
     # Per-symbol bucket
     if symbol not in report.per_symbol:
         report.per_symbol[symbol] = AggregateStats()
     sym_bucket = report.per_symbol[symbol]
     sym_bucket.trades += 1
-    if trade.r_multiple > Decimal(0):
-        sym_bucket.wins += 1
-    else:
-        sym_bucket.losses += 1
+    sym_bucket.wins += w
+    sym_bucket.losses += l
+    sym_bucket.break_even += b
     sym_bucket.total_r += trade.r_multiple
     sym_bucket.total_fees += trade.fees_paid
 
@@ -290,10 +297,9 @@ def _update_stats(
         report.per_pattern_regime[key] = AggregateStats()
     pr_bucket = report.per_pattern_regime[key]
     pr_bucket.trades += 1
-    if trade.r_multiple > Decimal(0):
-        pr_bucket.wins += 1
-    else:
-        pr_bucket.losses += 1
+    pr_bucket.wins += w
+    pr_bucket.losses += l
+    pr_bucket.break_even += b
     pr_bucket.total_r += trade.r_multiple
     pr_bucket.total_fees += trade.fees_paid
 
@@ -453,7 +459,6 @@ class ReplayEngine:
                 fee_rate=cfg.fee_rate,
                 symbol=symbol,
                 pattern_id=pattern_id,
-                regime_id_val=regime.regime_id.value,
                 timestamp=next_bar.timestamp,
                 regime_classification=regime,
             )

@@ -13,9 +13,10 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from invictus_signals.config import AssetConfig, get_config
-from invictus_signals.models import Candle, RegimeId
+from invictus_signals.models import Candle
 from invictus_signals.regime_classifier import classify_regime
 from invictus_signals.ta_engine import compute_ta_state
+from invictus_signals.backtest.engine import _MIN_WARMUP_BARS
 
 
 @dataclass
@@ -109,8 +110,9 @@ def validate_regime_labels(
 
         sym_ts_index = ts_index.get(sym, {})
         bar_idx = sym_ts_index.get(row.timestamp)
-        if bar_idx is None or bar_idx < 2:
-            # Not enough preceding bars for TA computation
+        if bar_idx is None or bar_idx < _MIN_WARMUP_BARS:
+            # Not enough preceding bars for TA computation — skip to match
+            # the same gate the replay engine applies (30-bar warmup floor).
             skipped += 1
             continue
 

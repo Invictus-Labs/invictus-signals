@@ -651,7 +651,9 @@ def run_universal_dnt_filters(
 
     results.append(dnt_05_trapped_between_mas(current_price, ta_state))
     results.append(
-        dnt_06_no_short_uptrend(ta_state, intended_direction, regime.regime_class)
+        dnt_06_no_short_uptrend(
+            ta_state, intended_direction, regime.regime_class, regime_bias=regime.bias
+        )
     )
 
     if trigger_level is not None:
@@ -662,7 +664,15 @@ def run_universal_dnt_filters(
         )
 
     results.append(dnt_08_overtrading(trade_count, cfg.max_trades_per_day))
-    results.append(dnt_09_buying_downtrend(ta_state, current_price, intended_direction))
+    results.append(
+        dnt_09_buying_downtrend(
+            ta_state,
+            current_price,
+            intended_direction,
+            regime_class=regime.regime_class,
+            regime_bias=regime.bias,
+        )
+    )
     results.append(dnt_10_news_no_structure(has_pending_event, lines))
     results.append(dnt_11_emotional_trading(has_pattern_signal))
     results.append(dnt_12_low_volume(current_volume, volume_baseline))
