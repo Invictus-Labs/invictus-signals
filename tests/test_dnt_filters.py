@@ -546,3 +546,241 @@ class TestRunUniversalDNTFilters:
             candles, two_good_lines, regime_bullish, spy_ta_bullish, 0
         )
         assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# E4: TRANSITION-regime bias coupling tests
+# ---------------------------------------------------------------------------
+
+class TestDNT06BiasCoupling:
+    """E4: dnt_06 extended with regime_bias for TRANSITION regimes."""
+
+    def test_back_compat_no_bias_arg_no_change(self) -> None:
+        """Omitting regime_bias keeps byte-identical behaviour to prior release."""
+        ta = make_ta(ma_fast_slope=-0.5)
+        # No bias arg — should NOT trigger (negative slope, no bullish regime)
+        result = dnt_06_no_short_uptrend(ta, Direction.SHORT, RegimeClass.TRANSITION)
+        assert result.triggered is False
+
+    def test_transition_long_bias_blocks_short(self) -> None:
+        """T3_BULL_REVERSAL / T8_POST_BOUNCE carry bias=LONG — shorts blocked."""
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(
+            ta, Direction.SHORT, RegimeClass.TRANSITION, regime_bias=Direction.LONG
+        )
+        assert result.triggered is True
+        assert "TRANSITION" in result.reason
+        assert "LONG" in result.reason
+
+    def test_transition_short_bias_does_not_block_short(self) -> None:
+        """bias=SHORT in TRANSITION (T5/T6) — short is allowed by dnt_06."""
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(
+            ta, Direction.SHORT, RegimeClass.TRANSITION, regime_bias=Direction.SHORT
+        )
+        assert result.triggered is False
+
+    def test_long_direction_never_blocked_even_with_bias_long(self) -> None:
+        """dnt_06 only applies to SHORT direction."""
+        ta = make_ta(ma_fast_slope=-0.1)
+        result = dnt_06_no_short_uptrend(
+            ta, Direction.LONG, RegimeClass.TRANSITION, regime_bias=Direction.LONG
+        )
+        assert result.triggered is False
+
+    def test_slope_up_takes_precedence_over_bias_branch(self) -> None:
+        """When slope_up is True the slope branch fires first (precedence check)."""
+        ta = make_ta(ma_fast_slope=0.5)
+        result = dnt_06_no_short_uptrend(
+            ta, Direction.SHORT, RegimeClass.TRANSITION, regime_bias=Direction.LONG
+        )
+        assert result.triggered is True
+        # Slope branch fires — reason should cite slope, not TRANSITION
+        assert "slope" in result.reason.lower()
+
+    def test_none_bias_with_transition_does_not_block(self) -> None:
+        """regime_bias=None (default) with TRANSITION class: no block."""
+        ta = make_ta(ma_fast_slope=-0.5)
+        result = dnt_06_no_short_uptrend(
+            ta, Direction.SHORT, RegimeClass.TRANSITION, regime_bias=None
+        )
+        assert result.triggered is False
+
+
+class TestDNT09BiasCoupling:
+    """E4: dnt_09 extended with regime_bias for TRANSITION regimes."""
+
+    def test_back_compat_no_bias_arg_no_change(self) -> None:
+        """Omitting regime_bias keeps byte-identical behaviour to prior release."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        result = dnt_09_buying_downtrend(
+            ta, current_price=100.0, intended_direction=Direction.LONG
+        )
+        assert result.triggered is False
+
+    def test_transition_short_bias_blocks_long(self) -> None:
+        """T5_BEAR_REVERSAL / T6_HL_BREACH carry bias=SHORT — longs blocked."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        result = dnt_09_buying_downtrend(
+            ta,
+            current_price=100.0,
+            intended_direction=Direction.LONG,
+            regime_class=RegimeClass.TRANSITION,
+            regime_bias=Direction.SHORT,
+        )
+        assert result.triggered is True
+        assert "TRANSITION" in result.reason
+        assert "SHORT" in result.reason
+
+    def test_transition_long_bias_does_not_block_long(self) -> None:
+        """bias=LONG in TRANSITION (T3/T8) — long is allowed by dnt_09."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        result = dnt_09_buying_downtrend(
+            ta,
+            current_price=100.0,
+            intended_direction=Direction.LONG,
+            regime_class=RegimeClass.TRANSITION,
+            regime_bias=Direction.LONG,
+        )
+        assert result.triggered is False
+
+    def test_short_direction_never_blocked_by_bias(self) -> None:
+        """dnt_09 only applies to LONG direction."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        result = dnt_09_buying_downtrend(
+            ta,
+            current_price=100.0,
+            intended_direction=Direction.SHORT,
+            regime_class=RegimeClass.TRANSITION,
+            regime_bias=Direction.SHORT,
+        )
+        assert result.triggered is False
+
+    def test_daily_knife_and_transition_short_bias_both_active(self) -> None:
+        """When both daily_knife AND transition_short_bias are active."""
+        ta = make_ta(ma_mid=105.0, ma_fast_slope=-0.5)
+        result = dnt_09_buying_downtrend(
+            ta,
+            current_price=100.0,
+            intended_direction=Direction.LONG,
+            regime_class=RegimeClass.TRANSITION,
+            regime_bias=Direction.SHORT,
+        )
+        assert result.triggered is True
+        # Reason should mention both conditions
+        assert "ALSO" in result.reason or "regime TRANSITION" in result.reason
+
+    def test_none_bias_with_transition_does_not_block(self) -> None:
+        """regime_bias=None (default) with TRANSITION class: no block from bias."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        result = dnt_09_buying_downtrend(
+            ta,
+            current_price=100.0,
+            intended_direction=Direction.LONG,
+            regime_class=RegimeClass.TRANSITION,
+            regime_bias=None,
+        )
+        assert result.triggered is False
+
+
+# ---------------------------------------------------------------------------
+# P1 DISPATCHER regression: run_universal_dnt_filters must thread regime.bias
+# (These tests call via the aggregator — the path the bot actually uses.)
+# ---------------------------------------------------------------------------
+
+class TestDispatcherBiasCoupling:
+    """Regression: E4 bias coupling was dead in production because
+    run_universal_dnt_filters was not forwarding regime.bias to dnt_06/09.
+    These tests exercise the full aggregator path, NOT the filter directly."""
+
+    def test_dnt06_transition_long_bias_triggers_via_dispatcher(
+        self, spy_candles_bullish, two_good_lines
+    ) -> None:
+        """TRANSITION regime + bias=LONG + SHORT direction → dnt_06 must trigger
+        through the dispatcher.  Fails if aggregator omits regime_bias=."""
+        from invictus_signals.models import RegimeId, RegimeClassification
+        ta = make_ta(ma_fast_slope=-0.1)
+        regime = RegimeClassification(
+            regime_id=RegimeId.T3_BULL_REVERSAL,
+            regime_class=RegimeClass.TRANSITION,
+            bias=Direction.LONG,
+            size_multiplier=0.75,
+            conditions_met=["golden cross forming"],
+            confidence=0.70,
+        )
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.SHORT,
+        )
+        dnt06 = next(r for r in results if r.filter_id == "dnt_06_no_short_uptrend")
+        assert dnt06.triggered is True, (
+            "E4 P1: dnt_06 must block shorts in T3/T8 TRANSITION+LONG-bias "
+            "via the aggregator — bias was not threaded"
+        )
+
+    def test_dnt09_transition_short_bias_triggers_via_dispatcher(
+        self, spy_candles_bullish, two_good_lines
+    ) -> None:
+        """TRANSITION regime + bias=SHORT + LONG direction → dnt_09 must trigger
+        through the dispatcher.  Fails if aggregator omits regime_class/bias."""
+        from invictus_signals.models import RegimeId, RegimeClassification
+        # Daily conditions: no knife (slope positive, price above mid) so the
+        # only trigger here is the TRANSITION+SHORT bias path.
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        regime = RegimeClassification(
+            regime_id=RegimeId.T6_HL_BREACH,
+            regime_class=RegimeClass.TRANSITION,
+            bias=Direction.SHORT,
+            size_multiplier=0.5,
+            conditions_met=["price < mid MA", "fast slope < 0"],
+            confidence=0.60,
+        )
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.LONG,
+        )
+        dnt09 = next(r for r in results if r.filter_id == "dnt_09_buying_downtrend")
+        assert dnt09.triggered is True, (
+            "E4 P1: dnt_09 must block longs in T5/T6 TRANSITION+SHORT-bias "
+            "via the aggregator — regime_class/bias were not threaded"
+        )
+
+    def test_dnt06_choppy_bias_none_does_not_block_short(
+        self, spy_candles_bullish, two_good_lines, regime_choppy
+    ) -> None:
+        """CHOPPY regime has bias=None — dnt_06 must NOT trigger on flat slope."""
+        ta = make_ta(ma_fast_slope=-0.1)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime_choppy,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.SHORT,
+        )
+        dnt06 = next(r for r in results if r.filter_id == "dnt_06_no_short_uptrend")
+        assert dnt06.triggered is False
+
+    def test_dnt09_choppy_bias_none_does_not_block_long(
+        self, spy_candles_bullish, two_good_lines, regime_choppy
+    ) -> None:
+        """CHOPPY regime has bias=None — dnt_09 must NOT trigger when no daily knife."""
+        ta = make_ta(ma_mid=95.0, ma_fast_slope=0.5)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish,
+            two_good_lines,
+            regime_choppy,
+            ta,
+            trade_count=0,
+            intended_direction=Direction.LONG,
+        )
+        dnt09 = next(r for r in results if r.filter_id == "dnt_09_buying_downtrend")
+        assert dnt09.triggered is False

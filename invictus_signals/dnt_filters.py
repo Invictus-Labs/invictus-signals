@@ -216,21 +216,22 @@ def dnt_06_no_short_uptrend(
     ta: TAState,
     intended_direction: Direction,
     regime_class: RegimeClass | None = None,
+    *,
+    regime_bias: Direction | None = None,
 ) -> DNTResult:
     """DNT 06: Do not short in an active uptrend.
 
-    Triggered when intended direction is SHORT and EITHER the fast MA slope is
-    positive OR the regime classifier has labelled the market BULLISH.
+    Triggered when intended direction is SHORT and ANY of:
+      - The fast MA slope is positive (original slope gate).
+      - The regime class is BULLISH (b7/b8 pullback fix, 2026-06-13).
+      - The regime bias is LONG in a TRANSITION regime — blocks shorts in
+        bullish-leaning transitions (T3_BULL_REVERSAL, T8_POST_BOUNCE) that
+        carry ``bias=LONG`` but ``regime_class=TRANSITION``.  Without this,
+        a T3/T8 short slips through the BULLISH equality check even though
+        the market is clearly bias-long. (E4, alpha-wave1.)
 
-    The slope test alone diverges from the regime definition of "uptrend": a
-    pullback inside a confirmed uptrend (e.g. the b7 higher-low-defense regime,
-    where price > mid MA and fast MA > mid MA) has a flat-or-negative 5-bar
-    close slope while still being BULLISH. The slope-only gate let those shorts
-    through and they were run over (2026-06-13 HYPE SD short, regime
-    b7_hl_defense, -$17.29). Honouring the regime label closes that divergence
-    so the gate actually does what its name says. ``regime_class`` is optional
-    (defaults to None) to preserve back-compat for callers that only pass the
-    TAState; when None the original slope-only behaviour applies.
+    All three inputs are optional beyond ``ta`` and ``intended_direction``;
+    omitting them preserves byte-identical behaviour to prior releases.
     """
     if intended_direction != Direction.SHORT:
         return _make_result(
@@ -242,7 +243,12 @@ def dnt_06_no_short_uptrend(
         )
     slope_up = ta.ma_fast_slope > 0
     bullish_regime = regime_class == RegimeClass.BULLISH
-    triggered = slope_up or bullish_regime
+    # Block shorts when regime class is TRANSITION but bias is LONG (e.g. T3/T8).
+    # When regime_bias is None the check is False — full back-compat.
+    transition_long_bias = (
+        regime_class == RegimeClass.TRANSITION and regime_bias == Direction.LONG
+    )
+    triggered = slope_up or bullish_regime or transition_long_bias
     if slope_up:
         detail = (
             f"Fast MA slope={ta.ma_fast_slope:.4f} > 0 — uptrend intact, no shorting"
@@ -251,6 +257,11 @@ def dnt_06_no_short_uptrend(
         detail = (
             f"Regime BULLISH (price/MA structure up) with flat slope "
             f"({ta.ma_fast_slope:.4f}) — no shorting into a confirmed uptrend"
+        )
+    elif transition_long_bias:
+        detail = (
+            f"Regime TRANSITION with bias=LONG (slope={ta.ma_fast_slope:.4f}) "
+            f"— bullish-leaning reversal, no shorting"
         )
     else:
         detail = (
@@ -328,6 +339,9 @@ def dnt_09_buying_downtrend(
     ta: TAState,
     current_price: float,
     intended_direction: Direction,
+    *,
+    regime_class: RegimeClass | None = None,
+    regime_bias: Direction | None = None,
 ) -> DNTResult:
     """DNT 09: Do not buy in a downtrend / catch falling knives.
 
@@ -341,6 +355,13 @@ def dnt_09_buying_downtrend(
 
     A TAState without intraday data (intraday_ma_fast == 0.0 sentinel) keeps
     the original daily-only behavior — the release never applies.
+
+    E4 — TRANSITION-regime bias coupling: also block longs when the regime
+    class is TRANSITION with ``bias=SHORT`` (bearish-leaning transitions
+    T5_BEAR_REVERSAL / T6_HL_BREACH that carry ``bias=SHORT`` but
+    ``regime_class=TRANSITION``).  Mirrors the dnt_06 extension symmetrically.
+    Both ``regime_class`` and ``regime_bias`` default to None — full
+    back-compat when omitted.
     """
     if intended_direction != Direction.LONG:
         return _make_result(
@@ -356,13 +377,24 @@ def dnt_09_buying_downtrend(
         and current_price > ta.intraday_ma_fast
         and ta.intraday_close_slope > 0
     )
-    triggered = daily_knife and not intraday_recovery
-    if triggered:
+    # Block longs when regime class is TRANSITION but bias is SHORT (e.g. T5/T6).
+    # When regime_bias is None the check is False — full back-compat.
+    transition_short_bias = (
+        regime_class == RegimeClass.TRANSITION and regime_bias == Direction.SHORT
+    )
+    triggered = (daily_knife and not intraday_recovery) or transition_short_bias
+    if daily_knife and not intraday_recovery and not transition_short_bias:
         detail = (
             f"Fast slope={ta.ma_fast_slope:.4f} < 0 AND price={current_price:.4f} "
             f"< mid MA={ta.ma_mid:.4f} — falling knife (no intraday recovery: "
             f"intraday MA={ta.intraday_ma_fast:.4f}, "
             f"intraday slope={ta.intraday_close_slope:.4f})"
+        )
+    elif daily_knife and not intraday_recovery and transition_short_bias:
+        detail = (
+            f"Fast slope={ta.ma_fast_slope:.4f} < 0 AND price={current_price:.4f} "
+            f"< mid MA={ta.ma_mid:.4f} — falling knife; ALSO regime TRANSITION "
+            f"with bias=SHORT"
         )
     elif daily_knife:
         detail = (
@@ -370,6 +402,11 @@ def dnt_09_buying_downtrend(
             f"price={current_price:.4f} < mid MA={ta.ma_mid:.4f}) RELEASED by "
             f"intraday recovery: price > intraday MA={ta.intraday_ma_fast:.4f} "
             f"AND intraday slope={ta.intraday_close_slope:.4f} > 0"
+        )
+    elif transition_short_bias:
+        detail = (
+            f"Regime TRANSITION with bias=SHORT (slope={ta.ma_fast_slope:.4f}) "
+            f"— bearish-leaning reversal, no longs"
         )
     else:
         detail = "No downtrend knife catch detected"
@@ -614,7 +651,9 @@ def run_universal_dnt_filters(
 
     results.append(dnt_05_trapped_between_mas(current_price, ta_state))
     results.append(
-        dnt_06_no_short_uptrend(ta_state, intended_direction, regime.regime_class)
+        dnt_06_no_short_uptrend(
+            ta_state, intended_direction, regime.regime_class, regime_bias=regime.bias
+        )
     )
 
     if trigger_level is not None:
@@ -625,7 +664,15 @@ def run_universal_dnt_filters(
         )
 
     results.append(dnt_08_overtrading(trade_count, cfg.max_trades_per_day))
-    results.append(dnt_09_buying_downtrend(ta_state, current_price, intended_direction))
+    results.append(
+        dnt_09_buying_downtrend(
+            ta_state,
+            current_price,
+            intended_direction,
+            regime_class=regime.regime_class,
+            regime_bias=regime.bias,
+        )
+    )
     results.append(dnt_10_news_no_structure(has_pending_event, lines))
     results.append(dnt_11_emotional_trading(has_pattern_signal))
     results.append(dnt_12_low_volume(current_volume, volume_baseline))
