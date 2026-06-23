@@ -677,6 +677,7 @@ def run_universal_dnt_filters(
 
     results.append(dnt_01_no_structure(lines))
     results.append(dnt_02_choppy(candles, cfg.choppy_range_threshold))
+    results.append(dnt_14_weak_intraday_trend(ta_state, cfg.min_intraday_adx))
 
     if trigger_level is not None:
         results.append(dnt_03_no_breakout_confirmation(candles, trigger_level, intended_direction))
