@@ -376,6 +376,12 @@ def compute_ta_state(
     else:
         intraday_close_slope = 0.0
 
+    # Intraday trend strength: ADX on the *intraday* bars (the entry timeframe).
+    # This is the discriminator the trend-strength gate keys off — winners enter
+    # on a strongly-trending 1H, losers on a choppy 1H. Distinct from the daily
+    # `adx` below, which is computed from daily_candles.
+    intraday_adx = calculate_adx(list(candles))
+
     # --- Volume MA (intraday) ---
     vol_period = min(cfg.volume_ma_period, len(intraday_volumes))
     volume_ma = calculate_sma(intraday_volumes, vol_period)
@@ -410,4 +416,5 @@ def compute_ta_state(
         adx=adx,
         intraday_ma_fast=intraday_ma_fast,
         intraday_close_slope=intraday_close_slope,
+        intraday_adx=intraday_adx,
     )

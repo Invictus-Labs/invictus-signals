@@ -277,6 +277,41 @@ def dnt_06_no_short_uptrend(
     )
 
 
+def dnt_14_weak_intraday_trend(
+    ta: TAState,
+    min_intraday_adx: float = 30.0,
+) -> DNTResult:
+    """DNT 14: Veto entries when the entry-timeframe (1H) trend is too weak.
+
+    Momentum/breakout patterns (LB, SD, FB, ...) only have edge when the 1H is
+    genuinely trending; in 1H chop they get faded in BOTH directions. Keyed off
+    ``ta.intraday_adx`` (ADX on the intraday bars), NOT the daily ``ta.adx`` — a
+    trending daily can sit on a choppy 1H, and daily ADX is empirically inverted
+    vs trade outcomes (winners ~46 / losers ~26 on the 1H; the reverse on daily).
+
+    ``intraday_adx <= 0`` is the "no intraday data" sentinel and fails OPEN (does
+    not trigger) so warmup TAStates behave exactly as before.
+
+    Args:
+        ta: Current TA state (must carry ``intraday_adx``).
+        min_intraday_adx: Minimum 1H ADX to permit a momentum entry.
+    """
+    adx = ta.intraday_adx
+    triggered = 0.0 < adx < min_intraday_adx
+    return _make_result(
+        "dnt_14_weak_intraday_trend",
+        "Weak Intraday Trend (Chop Guard)",
+        triggered,
+        (
+            f"1H ADX {adx:.1f} < {min_intraday_adx:.1f} — choppy entry timeframe; "
+            "momentum entries get faded"
+            if triggered
+            else f"1H ADX {adx:.1f} >= {min_intraday_adx:.1f} (or absent) — entry trend OK"
+        ),
+        0.0,
+    )
+
+
 def dnt_07_chasing_missed_entry(
     current_price: float,
     trigger_level: float,

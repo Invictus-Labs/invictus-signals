@@ -153,6 +153,12 @@ class TAState:
     # to daily-only behavior, so TAStates built without them are unchanged.
     intraday_ma_fast: float = 0.0
     intraday_close_slope: float = 0.0
+    # Intraday trend strength (ADX on the intraday bars). The entry-timeframe
+    # trend-strength gate keys off this: momentum/breakout patterns only have
+    # edge when the 1H is genuinely trending; in 1H chop they get faded both
+    # ways. Daily ADX is the WRONG lens (a trending daily can sit on a choppy
+    # 1H — empirically inverted vs outcomes). 0.0 = no intraday data (absent).
+    intraday_adx: float = 0.0
 
 
 @dataclass
