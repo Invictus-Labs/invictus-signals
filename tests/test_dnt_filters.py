@@ -43,6 +43,7 @@ def make_ta(
     bb_middle: float = 100.0,
     intraday_ma_fast: float = 0.0,
     intraday_close_slope: float = 0.0,
+    intraday_adx: float = 0.0,
 ) -> TAState:
     return TAState(
         ma_fast=ma_fast, ma_mid=ma_mid, ma_slow=90.0,
@@ -51,6 +52,7 @@ def make_ta(
         bb_width=0.1, bb_upper_slope=0.0, volume_ma=1000.0, vwap=100.0,
         intraday_ma_fast=intraday_ma_fast,
         intraday_close_slope=intraday_close_slope,
+        intraday_adx=intraday_adx,
     )
 
 
@@ -459,6 +461,40 @@ class TestRunUniversalDNTFilters:
         )
         assert isinstance(results, list)
         assert len(results) > 0
+
+    def test_dnt_14_triggers_through_dispatcher_in_chop(
+        self, spy_candles_bullish, two_good_lines, regime_bullish
+    ) -> None:
+        """A low-intraday-ADX TAState must make dnt_14 fire via the aggregator.
+
+        Guards the wiring: dnt_14 is appended in run_universal_dnt_filters and
+        keys off cfg.min_intraday_adx (35.0). 0 < 15 < 35 => triggered.
+        """
+        ta_choppy = make_ta(intraday_adx=15.0)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish, two_good_lines, regime_bullish, ta_choppy,
+            trade_count=0, config=get_config("SPY"),
+        )
+        dnt_14 = next(
+            (r for r in results if r.filter_id == "dnt_14_weak_intraday_trend"), None
+        )
+        assert dnt_14 is not None, "dnt_14 must be present in the aggregator results"
+        assert dnt_14.triggered is True
+
+    def test_dnt_14_passes_through_dispatcher_in_trend(
+        self, spy_candles_bullish, two_good_lines, regime_bullish
+    ) -> None:
+        """A strongly-trending 1H (high intraday ADX) must NOT trip dnt_14."""
+        ta_trend = make_ta(intraday_adx=50.0)
+        results = run_universal_dnt_filters(
+            spy_candles_bullish, two_good_lines, regime_bullish, ta_trend,
+            trade_count=0, config=get_config("SPY"),
+        )
+        dnt_14 = next(
+            (r for r in results if r.filter_id == "dnt_14_weak_intraday_trend"), None
+        )
+        assert dnt_14 is not None
+        assert dnt_14.triggered is False
 
     def test_all_results_are_dnt_result(
         self, spy_candles_bullish, two_good_lines, regime_bullish, spy_ta_bullish

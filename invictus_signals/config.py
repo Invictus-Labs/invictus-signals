@@ -37,6 +37,7 @@ class AssetConfig:
     # DNT filters
     choppy_range_threshold: float = 1.0      # Min range for "not choppy"
     chase_threshold_pct: float = 0.001       # Max chase distance as % of price
+    min_intraday_adx: float = 35.0           # Min 1H ADX to take momentum entries (chop guard); validated ADX>=35 (PF 1.81)
     max_trades_per_day: int = 3
     max_consecutive_losses: int = 2
 

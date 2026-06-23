@@ -1,9 +1,12 @@
 """Universal Do-Not-Trade filters for invictus-signals.
 
-Implements 13+ asset-agnostic DNT filters. SPY-specific filters
+Implements 16+ asset-agnostic DNT filters. SPY-specific filters
 (opening trap, VWAP EOD, IV/theta, mobile) are excluded. Filter 07
 uses a percentage-based chase threshold from AssetConfig instead of
 absolute SPY points.
+
+Note: options-intel has a distinct local ``dnt_14_opening_trap`` in its own
+engine; the ``dnt_14`` number is reused there but never imported from here.
 
 All logic is deterministic — no I/O, no side effects.
 """
@@ -274,6 +277,41 @@ def dnt_06_no_short_uptrend(
         triggered,
         detail,
         14.9,
+    )
+
+
+def dnt_14_weak_intraday_trend(
+    ta: TAState,
+    min_intraday_adx: float = 35.0,
+) -> DNTResult:
+    """DNT 14: Veto entries when the entry-timeframe (1H) trend is too weak.
+
+    Momentum/breakout patterns (LB, SD, FB, ...) only have edge when the 1H is
+    genuinely trending; in 1H chop they get faded in BOTH directions. Keyed off
+    ``ta.intraday_adx`` (ADX on the intraday bars), NOT the daily ``ta.adx`` — a
+    trending daily can sit on a choppy 1H, and daily ADX is empirically inverted
+    vs trade outcomes (winners ~46 / losers ~26 on the 1H; the reverse on daily).
+
+    ``intraday_adx <= 0`` is the "no intraday data" sentinel and fails OPEN (does
+    not trigger) so warmup TAStates behave exactly as before.
+
+    Args:
+        ta: Current TA state (must carry ``intraday_adx``).
+        min_intraday_adx: Minimum 1H ADX to permit a momentum entry.
+    """
+    adx = ta.intraday_adx
+    triggered = 0.0 < adx < min_intraday_adx
+    return _make_result(
+        "dnt_14_weak_intraday_trend",
+        "Weak Intraday Trend (Chop Guard)",
+        triggered,
+        (
+            f"1H ADX {adx:.1f} < {min_intraday_adx:.1f} — choppy entry timeframe; "
+            "momentum entries get faded"
+            if triggered
+            else f"1H ADX {adx:.1f} >= {min_intraday_adx:.1f} (or absent) — entry trend OK"
+        ),
+        0.0,
     )
 
 
@@ -610,7 +648,7 @@ def run_universal_dnt_filters(
 ) -> list[DNTResult]:
     """Run all universal DNT filters and return results.
 
-    Runs 13+ filters that are asset-agnostic. SPY-specific filters
+    Runs 16+ filters that are asset-agnostic. SPY-specific filters
     (opening trap, VWAP EOD, IV/theta, mobile) are not included.
 
     Args:
@@ -642,6 +680,7 @@ def run_universal_dnt_filters(
 
     results.append(dnt_01_no_structure(lines))
     results.append(dnt_02_choppy(candles, cfg.choppy_range_threshold))
+    results.append(dnt_14_weak_intraday_trend(ta_state, cfg.min_intraday_adx))
 
     if trigger_level is not None:
         results.append(dnt_03_no_breakout_confirmation(candles, trigger_level, intended_direction))
