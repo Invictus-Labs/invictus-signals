@@ -290,6 +290,17 @@ class TestComputeTAState:
         ta = compute_ta_state(intraday, daily, config=get_config("BTC"))
         assert ta.intraday_ma_fast == pytest.approx(104.5)
         assert ta.intraday_close_slope == pytest.approx(1.0)
+        # intraday_adx is populated (0.0 here: only 10 intraday bars, < ADX warmup)
+        assert ta.intraday_adx == 0.0
+
+    def test_intraday_adx_populated_on_trending_session(self) -> None:
+        """A long, strongly-trending intraday series yields a real (>0) ADX,
+        computed from the INTRADAY candles (not the daily ones)."""
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        # 30 strongly-rising intraday closes -> high directional movement.
+        intraday = make_candles([100.0 + i for i in range(30)])
+        ta = compute_ta_state(intraday, daily, config=get_config("BTC"))
+        assert ta.intraday_adx > 0.0
 
     def test_intraday_slope_negative_on_falling_session(self) -> None:
         daily = make_candles([80_000 + i * 50 for i in range(30)])

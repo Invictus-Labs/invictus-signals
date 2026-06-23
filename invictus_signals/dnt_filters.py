@@ -1,9 +1,12 @@
 """Universal Do-Not-Trade filters for invictus-signals.
 
-Implements 13+ asset-agnostic DNT filters. SPY-specific filters
+Implements 16+ asset-agnostic DNT filters. SPY-specific filters
 (opening trap, VWAP EOD, IV/theta, mobile) are excluded. Filter 07
 uses a percentage-based chase threshold from AssetConfig instead of
 absolute SPY points.
+
+Note: options-intel has a distinct local ``dnt_14_opening_trap`` in its own
+engine; the ``dnt_14`` number is reused there but never imported from here.
 
 All logic is deterministic — no I/O, no side effects.
 """
@@ -279,7 +282,7 @@ def dnt_06_no_short_uptrend(
 
 def dnt_14_weak_intraday_trend(
     ta: TAState,
-    min_intraday_adx: float = 30.0,
+    min_intraday_adx: float = 35.0,
 ) -> DNTResult:
     """DNT 14: Veto entries when the entry-timeframe (1H) trend is too weak.
 
@@ -645,7 +648,7 @@ def run_universal_dnt_filters(
 ) -> list[DNTResult]:
     """Run all universal DNT filters and return results.
 
-    Runs 13+ filters that are asset-agnostic. SPY-specific filters
+    Runs 16+ filters that are asset-agnostic. SPY-specific filters
     (opening trap, VWAP EOD, IV/theta, mobile) are not included.
 
     Args:
