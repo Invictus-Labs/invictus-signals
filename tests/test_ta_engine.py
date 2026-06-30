@@ -292,6 +292,22 @@ class TestComputeTAState:
         assert ta.intraday_close_slope == pytest.approx(1.0)
         # intraday_adx is populated (0.0 here: only 10 intraday bars, < ADX warmup)
         assert ta.intraday_adx == 0.0
+        # Intraday mid MA: BTC mid period (26) capped at n=10 -> SMA(100..109).
+        assert ta.intraday_ma_mid == pytest.approx(104.5)
+        # Intraday BB computed from the intraday closes (not the daily ones):
+        # band straddles the intraday mean (~104.5) and sits far below the ~80k
+        # daily price, proving it is built from intraday bars.
+        assert ta.intraday_bb_lower < ta.intraday_ma_mid < ta.intraday_bb_upper
+        assert ta.intraday_bb_upper < 200.0
+
+    def test_intraday_bb_sentinel_with_single_candle(self) -> None:
+        # <2 intraday bars cannot form a band -> 0.0 sentinel (dnt_16 falls
+        # back to the daily BB).
+        daily = make_candles([500.0] * 25)
+        intraday = make_candles([500.0])
+        ta = compute_ta_state(intraday, daily)
+        assert ta.intraday_bb_upper == 0.0
+        assert ta.intraday_bb_lower == 0.0
 
     def test_intraday_adx_populated_on_trending_session(self) -> None:
         """A long, strongly-trending intraday series yields a real (>0) ADX,

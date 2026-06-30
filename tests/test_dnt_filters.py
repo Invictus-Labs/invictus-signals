@@ -44,6 +44,9 @@ def make_ta(
     intraday_ma_fast: float = 0.0,
     intraday_close_slope: float = 0.0,
     intraday_adx: float = 0.0,
+    intraday_ma_mid: float = 0.0,
+    intraday_bb_upper: float = 0.0,
+    intraday_bb_lower: float = 0.0,
 ) -> TAState:
     return TAState(
         ma_fast=ma_fast, ma_mid=ma_mid, ma_slow=90.0,
@@ -53,6 +56,9 @@ def make_ta(
         intraday_ma_fast=intraday_ma_fast,
         intraday_close_slope=intraday_close_slope,
         intraday_adx=intraday_adx,
+        intraday_ma_mid=intraday_ma_mid,
+        intraday_bb_upper=intraday_bb_upper,
+        intraday_bb_lower=intraday_bb_lower,
     )
 
 
@@ -153,6 +159,33 @@ class TestDNT05:
         ta = make_ta(ma_fast=102.0, ma_mid=103.0)
         result = dnt_05_trapped_between_mas(100.0, ta)
         assert result.triggered is False
+
+    def test_intraday_band_overrides_daily(self) -> None:
+        # Intraday band present -> the intraday MAs decide. Price 100 is between
+        # the intraday band (99-101) even though daily MAs say otherwise.
+        ta = make_ta(
+            ma_fast=200.0, ma_mid=300.0,  # daily band far away (would not trigger)
+            intraday_ma_fast=99.0, intraday_ma_mid=101.0,
+        )
+        result = dnt_05_trapped_between_mas(100.0, ta)
+        assert result.triggered is True
+
+    def test_daily_band_stale_does_not_trap_when_intraday_clear(self) -> None:
+        # Regression for dnt_05/HYPE 2026-06-05 (223 consecutive fires): price
+        # sits inside the STALE daily band (99-101) but has broken cleanly above
+        # the intraday band (97-98). With the intraday lens it must NOT trigger.
+        ta = make_ta(
+            ma_fast=99.0, ma_mid=101.0,  # stale daily band would falsely trap 100
+            intraday_ma_fast=97.0, intraday_ma_mid=98.0,
+        )
+        result = dnt_05_trapped_between_mas(100.0, ta)
+        assert result.triggered is False
+
+    def test_sentinel_falls_back_to_daily_band(self) -> None:
+        # No intraday data (0.0 sentinel) -> original daily-MA behavior.
+        ta = make_ta(ma_fast=99.0, ma_mid=101.0)  # intraday_* default 0.0
+        result = dnt_05_trapped_between_mas(100.0, ta)
+        assert result.triggered is True
 
 
 class TestDNT06:
@@ -425,6 +458,33 @@ class TestDNT16:
         ta = make_ta(bb_upper=105.0, bb_lower=95.0)
         result = dnt_16_extended_at_bb(98.0, ta, Direction.SHORT)
         assert result.triggered is False
+
+    def test_intraday_bb_overrides_daily_long(self) -> None:
+        # Intraday BB present -> price tested against the intraday upper band.
+        # Price 102 is below the stale daily upper (110) but >= intraday upper
+        # (101), so the long IS overextended on the entry timeframe.
+        ta = make_ta(
+            bb_upper=110.0, bb_lower=90.0,  # stale daily band would not trigger
+            intraday_bb_upper=101.0, intraday_bb_lower=99.0,
+        )
+        result = dnt_16_extended_at_bb(102.0, ta, Direction.LONG)
+        assert result.triggered is True
+
+    def test_intraday_bb_overrides_daily_no_false_block(self) -> None:
+        # Regression: price >= stale daily upper (105) but still inside the
+        # intraday band (upper 108) -> not extended on the entry timeframe.
+        ta = make_ta(
+            bb_upper=105.0, bb_lower=95.0,  # stale daily band would falsely block
+            intraday_bb_upper=108.0, intraday_bb_lower=102.0,
+        )
+        result = dnt_16_extended_at_bb(106.0, ta, Direction.LONG)
+        assert result.triggered is False
+
+    def test_sentinel_falls_back_to_daily_bb(self) -> None:
+        # No intraday BB (0.0 sentinel) -> original daily-BB behavior.
+        ta = make_ta(bb_upper=105.0, bb_lower=95.0)  # intraday_bb_* default 0.0
+        result = dnt_16_extended_at_bb(105.0, ta, Direction.LONG)
+        assert result.triggered is True
 
 
 class TestDNT17:

@@ -197,17 +197,27 @@ def dnt_05_trapped_between_mas(
     current_price: float,
     ta: TAState,
 ) -> DNTResult:
-    """DNT 05: Price trapped between fast and mid moving averages."""
-    lo = min(ta.ma_fast, ta.ma_mid)
-    hi = max(ta.ma_fast, ta.ma_mid)
+    """DNT 05: Price trapped between fast and mid moving averages.
+
+    Uses the *intraday* fast/mid MAs (entry-timeframe lens) when present. The
+    daily fast/mid band sits in a fixed range for days after a multi-day move,
+    so an intraday price oscillating inside that stale band fires every eval
+    (dnt_05/HYPE 2026-06-05: 223 consecutive fires). A TAState without intraday
+    data (intraday_ma_fast/intraday_ma_mid == 0.0 sentinel) keeps the original
+    daily-MA behavior.
+    """
+    ma_fast = ta.intraday_ma_fast if ta.intraday_ma_fast > 0.0 else ta.ma_fast
+    ma_mid = ta.intraday_ma_mid if ta.intraday_ma_mid > 0.0 else ta.ma_mid
+    lo = min(ma_fast, ma_mid)
+    hi = max(ma_fast, ma_mid)
     triggered = lo < current_price < hi
     return _make_result(
         "dnt_05_trapped_between_mas",
         "Price Trapped Between Moving Averages",
         triggered,
         (
-            f"Price {current_price:.4f} trapped between fast MA={ta.ma_fast:.4f} "
-            f"and mid MA={ta.ma_mid:.4f}"
+            f"Price {current_price:.4f} trapped between fast MA={ma_fast:.4f} "
+            f"and mid MA={ma_mid:.4f}"
             if triggered
             else f"Price {current_price:.4f} not between MAs ({lo:.4f}–{hi:.4f})"
         ),
@@ -560,20 +570,28 @@ def dnt_16_extended_at_bb(
 
     Long: triggered if price >= upper BB (overextended).
     Short: triggered if price <= lower BB without a structural base.
+
+    Uses the *intraday* BB (entry-timeframe lens) when present. The daily BB
+    sits far from intraday price for days after a multi-day move, mis-firing on
+    the 15m/1h entry timeframe (same daily-scale class as dnt_05/dnt_09). A
+    TAState without intraday data (intraday_bb_upper/intraday_bb_lower == 0.0
+    sentinel) keeps the original daily-BB behavior.
     """
+    bb_upper = ta.intraday_bb_upper if ta.intraday_bb_upper > 0.0 else ta.bb_upper
+    bb_lower = ta.intraday_bb_lower if ta.intraday_bb_lower > 0.0 else ta.bb_lower
     if intended_direction == Direction.LONG:
-        triggered = current_price >= ta.bb_upper
+        triggered = current_price >= bb_upper
         reason = (
-            f"Price {current_price:.4f} >= upper BB {ta.bb_upper:.4f} — overextended, no long"
+            f"Price {current_price:.4f} >= upper BB {bb_upper:.4f} — overextended, no long"
             if triggered
-            else f"Price {current_price:.4f} < upper BB {ta.bb_upper:.4f} — not extended"
+            else f"Price {current_price:.4f} < upper BB {bb_upper:.4f} — not extended"
         )
     else:
-        triggered = current_price <= ta.bb_lower
+        triggered = current_price <= bb_lower
         reason = (
-            f"Price {current_price:.4f} <= lower BB {ta.bb_lower:.4f} — no structural base"
+            f"Price {current_price:.4f} <= lower BB {bb_lower:.4f} — no structural base"
             if triggered
-            else f"Price {current_price:.4f} > lower BB {ta.bb_lower:.4f} — not extended"
+            else f"Price {current_price:.4f} > lower BB {bb_lower:.4f} — not extended"
         )
     return _make_result(
         "dnt_16_extended_at_bb",

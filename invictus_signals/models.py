@@ -159,6 +159,16 @@ class TAState:
     # ways. Daily ADX is the WRONG lens (a trending daily can sit on a choppy
     # 1H — empirically inverted vs outcomes). 0.0 = no intraday data (absent).
     intraday_adx: float = 0.0
+    # Intraday band structure for same-timeframe band gates (dnt_05 / dnt_16).
+    # The daily mid MA and BB bands sit in a fixed band for days after a
+    # multi-day move, so an intraday price oscillating inside that stale band
+    # mis-fires "trapped between MAs" (dnt_05) and "extended at BB" (dnt_16) on
+    # the 15m/1h entry timeframe (dnt_05/HYPE 2026-06-05: 223 consecutive
+    # fires). These give those filters an entry-timeframe lens. 0.0 = no
+    # intraday data (absent) → the filter falls back to its daily band.
+    intraday_ma_mid: float = 0.0
+    intraday_bb_upper: float = 0.0
+    intraday_bb_lower: float = 0.0
 
 
 @dataclass

@@ -370,6 +370,26 @@ def compute_ta_state(
     intraday_ma_fast = calculate_sma(
         intraday_closes, min(cfg.ma_fast_period, n_intraday)
     )
+    # Intraday mid MA — same mid period as the daily MA, on the intraday bars.
+    # dnt_05 ("trapped between MAs") needs the fast/mid band on the entry
+    # timeframe; the daily band stays fixed for days after a multi-day move.
+    intraday_ma_mid = calculate_sma(
+        intraday_closes, min(cfg.ma_mid_period, n_intraday)
+    )
+    # Intraday Bollinger Bands — same period/std as the daily BB, on the
+    # intraday bars. dnt_16 ("extended at BB") tests price against the
+    # entry-timeframe band, not the stale daily one. Needs >=2 bars to compute
+    # a band; otherwise 0.0 sentinel → dnt_16 falls back to the daily BB.
+    intraday_bb_period = min(cfg.bb_period, n_intraday)
+    if intraday_bb_period >= 2:
+        intraday_bb = calculate_bb(
+            intraday_closes, period=intraday_bb_period, std_dev=cfg.bb_std_dev
+        )
+        intraday_bb_upper = intraday_bb["upper"]
+        intraday_bb_lower = intraday_bb["lower"]
+    else:
+        intraday_bb_upper = 0.0
+        intraday_bb_lower = 0.0
     intraday_slope_period = min(5, n_intraday)
     if intraday_slope_period >= 2:
         intraday_close_slope = calculate_slope(intraday_closes, intraday_slope_period)
@@ -417,4 +437,7 @@ def compute_ta_state(
         intraday_ma_fast=intraday_ma_fast,
         intraday_close_slope=intraday_close_slope,
         intraday_adx=intraday_adx,
+        intraday_ma_mid=intraday_ma_mid,
+        intraday_bb_upper=intraday_bb_upper,
+        intraday_bb_lower=intraday_bb_lower,
     )
