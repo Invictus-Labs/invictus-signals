@@ -149,9 +149,11 @@ class TAState:
     atr_pct: float = 0.0
     # Intraday structure (from the intraday candles arg of compute_ta_state).
     # Defaults are sentinel "no intraday data": consumers that gate on these
-    # (e.g. dnt_09's recovery release) must treat 0.0 as absent and fall back
-    # to daily-only behavior, so TAStates built without them are unchanged.
+    # (e.g. dnt_09's recovery release, dnt_05's fast/mid band) must treat 0.0 as
+    # absent and fall back to daily-only behavior, so TAStates built without them
+    # are unchanged. ma_fast/ma_mid are co-populated and used together by dnt_05.
     intraday_ma_fast: float = 0.0
+    intraday_ma_mid: float = 0.0
     intraday_close_slope: float = 0.0
     # Intraday trend strength (ADX on the intraday bars). The entry-timeframe
     # trend-strength gate keys off this: momentum/breakout patterns only have
@@ -159,14 +161,11 @@ class TAState:
     # ways. Daily ADX is the WRONG lens (a trending daily can sit on a choppy
     # 1H — empirically inverted vs outcomes). 0.0 = no intraday data (absent).
     intraday_adx: float = 0.0
-    # Intraday band structure for same-timeframe band gates (dnt_05 / dnt_16).
-    # The daily mid MA and BB bands sit in a fixed band for days after a
-    # multi-day move, so an intraday price oscillating inside that stale band
-    # mis-fires "trapped between MAs" (dnt_05) and "extended at BB" (dnt_16) on
-    # the 15m/1h entry timeframe (dnt_05/HYPE 2026-06-05: 223 consecutive
-    # fires). These give those filters an entry-timeframe lens. 0.0 = no
-    # intraday data (absent) → the filter falls back to its daily band.
-    intraday_ma_mid: float = 0.0
+    # Intraday Bollinger bands for the same-timeframe band gate (dnt_16). The
+    # daily BB sits far from intraday price for days after a multi-day move, so
+    # dnt_16 ("extended at BB") mis-fires on the 15m/1h entry timeframe (same
+    # daily-scale class as dnt_05/HYPE 2026-06-05). Presence is keyed off the
+    # upper band (always > 0 for positive prices); 0.0 = absent → daily fallback.
     intraday_bb_upper: float = 0.0
     intraday_bb_lower: float = 0.0
 

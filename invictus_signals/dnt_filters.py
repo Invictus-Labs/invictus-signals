@@ -205,9 +205,18 @@ def dnt_05_trapped_between_mas(
     (dnt_05/HYPE 2026-06-05: 223 consecutive fires). A TAState without intraday
     data (intraday_ma_fast/intraday_ma_mid == 0.0 sentinel) keeps the original
     daily-MA behavior.
+
+    The intraday band is used atomically — both intraday MAs or both daily, never
+    a mixed intraday-fast/daily-mid band (which is meaningless). compute_ta_state
+    co-populates the pair; the joint gate also protects manually-built TAStates.
+    During warmup (one intraday bar) both intraday MAs collapse to the same close,
+    so lo == hi and the strict band never traps — dnt_05 fails open until enough
+    intraday history exists, consistent with the intraday_ma_fast precedent.
     """
-    ma_fast = ta.intraday_ma_fast if ta.intraday_ma_fast > 0.0 else ta.ma_fast
-    ma_mid = ta.intraday_ma_mid if ta.intraday_ma_mid > 0.0 else ta.ma_mid
+    if ta.intraday_ma_fast > 0.0 and ta.intraday_ma_mid > 0.0:
+        ma_fast, ma_mid = ta.intraday_ma_fast, ta.intraday_ma_mid
+    else:
+        ma_fast, ma_mid = ta.ma_fast, ta.ma_mid
     lo = min(ma_fast, ma_mid)
     hi = max(ma_fast, ma_mid)
     triggered = lo < current_price < hi
@@ -574,11 +583,20 @@ def dnt_16_extended_at_bb(
     Uses the *intraday* BB (entry-timeframe lens) when present. The daily BB
     sits far from intraday price for days after a multi-day move, mis-firing on
     the 15m/1h entry timeframe (same daily-scale class as dnt_05/dnt_09). A
-    TAState without intraday data (intraday_bb_upper/intraday_bb_lower == 0.0
-    sentinel) keeps the original daily-BB behavior.
+    TAState without intraday data (intraday_bb_upper == 0.0 sentinel) keeps the
+    original daily-BB behavior.
+
+    Presence is keyed off the UPPER band: bb_upper = mean + k·sigma is reliably
+    > 0 for positive prices, whereas bb_lower = mean - k·sigma can legitimately
+    be <= 0 under extreme intraday dispersion — keying the lower-side fallback
+    off `intraday_bb_lower > 0.0` would misread a real band as "no data" and fall
+    back to the stale daily band on shorts. Both bands are co-populated, so one
+    presence check drives both sides atomically.
     """
-    bb_upper = ta.intraday_bb_upper if ta.intraday_bb_upper > 0.0 else ta.bb_upper
-    bb_lower = ta.intraday_bb_lower if ta.intraday_bb_lower > 0.0 else ta.bb_lower
+    if ta.intraday_bb_upper > 0.0:
+        bb_upper, bb_lower = ta.intraday_bb_upper, ta.intraday_bb_lower
+    else:
+        bb_upper, bb_lower = ta.bb_upper, ta.bb_lower
     if intended_direction == Direction.LONG:
         triggered = current_price >= bb_upper
         reason = (

@@ -284,21 +284,24 @@ class TestComputeTAState:
 
     def test_intraday_fields_populated(self) -> None:
         daily = make_candles([80_000 + i * 50 for i in range(30)])
-        # 10 rising intraday closes 100..109: BTC fast period 12 capped at
-        # n=10 -> SMA = 104.5; OLS slope of last 5 closes = exactly 1.0.
-        intraday = make_candles([100.0 + i for i in range(10)])
+        # 15 rising intraday closes 100..114. BTC periods: fast=12, mid=26, bb=20.
+        # With n=15 the windows DIFFER (fast caps at 12, mid+bb cap at 15), so
+        # fast and mid produce distinct values — a swap of the two fields fails.
+        #   intraday_ma_fast = SMA(last 12: 103..114) = 108.5
+        #   intraday_ma_mid  = SMA(all 15: 100..114)  = 107.0
+        #   intraday BB(15)   : middle 107.0, pop-sigma sqrt(280/15)=4.3205,
+        #                       upper 107+2σ=115.641, lower 107-2σ=98.359
+        #   OLS slope of last 5 closes (110..114) = 1.0
+        intraday = make_candles([100.0 + i for i in range(15)])
         ta = compute_ta_state(intraday, daily, config=get_config("BTC"))
-        assert ta.intraday_ma_fast == pytest.approx(104.5)
+        assert ta.intraday_ma_fast == pytest.approx(108.5)
+        assert ta.intraday_ma_mid == pytest.approx(107.0)
+        assert ta.intraday_ma_fast != ta.intraday_ma_mid  # distinct windows
         assert ta.intraday_close_slope == pytest.approx(1.0)
-        # intraday_adx is populated (0.0 here: only 10 intraday bars, < ADX warmup)
-        assert ta.intraday_adx == 0.0
-        # Intraday mid MA: BTC mid period (26) capped at n=10 -> SMA(100..109).
-        assert ta.intraday_ma_mid == pytest.approx(104.5)
-        # Intraday BB computed from the intraday closes (not the daily ones):
-        # band straddles the intraday mean (~104.5) and sits far below the ~80k
-        # daily price, proving it is built from intraday bars.
-        assert ta.intraday_bb_lower < ta.intraday_ma_mid < ta.intraday_bb_upper
-        assert ta.intraday_bb_upper < 200.0
+        assert ta.intraday_adx >= 0.0  # populated (0.0 until ADX warmup met)
+        # Intraday BB computed from the intraday closes (not the ~80k daily ones).
+        assert ta.intraday_bb_upper == pytest.approx(115.641, abs=0.05)
+        assert ta.intraday_bb_lower == pytest.approx(98.359, abs=0.05)
 
     def test_intraday_bb_sentinel_with_single_candle(self) -> None:
         # <2 intraday bars cannot form a band -> 0.0 sentinel (dnt_16 falls

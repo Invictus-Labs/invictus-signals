@@ -187,6 +187,28 @@ class TestDNT05:
         result = dnt_05_trapped_between_mas(100.0, ta)
         assert result.triggered is True
 
+    def test_mixed_sentinel_falls_back_to_daily_atomically(self) -> None:
+        # Only ONE intraday MA present (e.g. a manually-built TAState) must NOT
+        # produce a mixed intraday-fast/daily-mid band — the gate is atomic, so
+        # it falls back to the daily band entirely. Daily band (99-101) traps 100.
+        ta = make_ta(
+            ma_fast=99.0, ma_mid=101.0,
+            intraday_ma_fast=97.0, intraday_ma_mid=0.0,  # mid missing -> use daily
+        )
+        result = dnt_05_trapped_between_mas(100.0, ta)
+        assert result.triggered is True
+
+    def test_single_intraday_bar_fails_open(self) -> None:
+        # Warmup: one intraday bar collapses fast==mid==close, so lo==hi and the
+        # strict band never traps. dnt_05 fails open (does not block) until more
+        # intraday history exists — does NOT revert to the stale daily band.
+        ta = make_ta(
+            ma_fast=99.0, ma_mid=101.0,  # daily band would trap 100
+            intraday_ma_fast=100.0, intraday_ma_mid=100.0,  # one-bar collapse
+        )
+        result = dnt_05_trapped_between_mas(100.0, ta)
+        assert result.triggered is False
+
 
 class TestDNT06:
     def test_triggers_when_shorting_uptrend(self) -> None:
@@ -485,6 +507,45 @@ class TestDNT16:
         ta = make_ta(bb_upper=105.0, bb_lower=95.0)  # intraday_bb_* default 0.0
         result = dnt_16_extended_at_bb(105.0, ta, Direction.LONG)
         assert result.triggered is True
+
+    def test_intraday_bb_overrides_daily_short(self) -> None:
+        # SHORT mirror: price tested against the intraday LOWER band. Price 94 is
+        # above the stale daily lower (90) but <= intraday lower (95), so the
+        # short IS overextended on the entry timeframe.
+        ta = make_ta(
+            bb_upper=110.0, bb_lower=90.0,  # stale daily band would not trigger
+            intraday_bb_upper=105.0, intraday_bb_lower=95.0,
+        )
+        result = dnt_16_extended_at_bb(94.0, ta, Direction.SHORT)
+        assert result.triggered is True
+
+    def test_intraday_bb_overrides_daily_no_false_block_short(self) -> None:
+        # SHORT regression: price <= stale daily lower (93) would falsely block,
+        # but price is still inside the intraday band (lower 89) -> not extended.
+        ta = make_ta(
+            bb_upper=105.0, bb_lower=93.0,  # stale daily band would falsely block
+            intraday_bb_upper=98.0, intraday_bb_lower=89.0,
+        )
+        result = dnt_16_extended_at_bb(92.0, ta, Direction.SHORT)
+        assert result.triggered is False
+
+    def test_sentinel_falls_back_to_daily_bb_short(self) -> None:
+        # SHORT sentinel: no intraday BB (0.0) -> original daily-BB short behavior.
+        ta = make_ta(bb_upper=105.0, bb_lower=95.0)  # intraday_bb_* default 0.0
+        result = dnt_16_extended_at_bb(95.0, ta, Direction.SHORT)
+        assert result.triggered is True
+
+    def test_negative_intraday_lower_band_still_uses_intraday(self) -> None:
+        # Extreme dispersion can drive intraday_bb_lower <= 0. Presence is keyed
+        # off the (always-positive) upper band, so the real intraday band is used
+        # and the stale daily band is NOT consulted. price 1.0 > intraday lower
+        # (-2.0) -> short NOT extended (would falsely trigger on daily lower 5.0).
+        ta = make_ta(
+            bb_upper=8.0, bb_lower=5.0,  # daily lower 5.0 would falsely block
+            intraday_bb_upper=10.0, intraday_bb_lower=-2.0,
+        )
+        result = dnt_16_extended_at_bb(1.0, ta, Direction.SHORT)
+        assert result.triggered is False
 
 
 class TestDNT17:
