@@ -421,6 +421,7 @@ def compute_ta_state(
     daily_candles: Sequence[Candle],
     config: AssetConfig | None = None,
     vol_lookback: int | None = None,
+    vol_min_samples: int = 2,
 ) -> TAState:
     """Compute the full TAState from intraday + daily candle history.
 
@@ -442,6 +443,16 @@ def compute_ta_state(
             (`None`, the default), both `_pct` fields stay `None` and this
             function's behavior for every existing field is unchanged from
             before this parameter existed (additive-only, AC-6).
+        vol_min_samples: Forwarded to `bbwp()`'s `min_samples` for both
+            percentile calls. Defaults to `bbwp()`'s own floor (2) — pure
+            passthrough, not a second default invented here. Exists so an
+            asset with structurally short daily history (SPCX,
+            `SPCX_MIN_DAILY_CANDLES=50`) can be made to abstain
+            (`bb_width_pct=None`) **by construction** rather than by
+            incidentally having too few candles today: without this, a
+            caller has no lever over `compute_ta_state` itself and must
+            gate candle length *before* calling in, which is easy to forget
+            and impossible to unit-test from this function's boundary.
 
     Returns:
         Populated TAState.
@@ -536,7 +547,7 @@ def compute_ta_state(
     # / intraday_bb["width"] above — never a second, divergent computation.
     if vol_lookback is not None and bb_period >= 2:
         daily_widths = _rolling_bb_widths(daily_closes, bb_period, cfg.bb_std_dev)
-        bb_width_pct = bbwp(daily_widths, vol_lookback)
+        bb_width_pct = bbwp(daily_widths, vol_lookback, min_samples=vol_min_samples)
     else:
         bb_width_pct = None
 
@@ -544,7 +555,9 @@ def compute_ta_state(
         intraday_widths = _rolling_bb_widths(
             intraday_closes, intraday_bb_period, cfg.bb_std_dev
         )
-        intraday_bb_width_pct = bbwp(intraday_widths, vol_lookback)
+        intraday_bb_width_pct = bbwp(
+            intraday_widths, vol_lookback, min_samples=vol_min_samples
+        )
     else:
         intraday_bb_width_pct = None
 

@@ -563,6 +563,30 @@ class TestComputeTAState:
         assert ta.intraday_bb_width_pct is None
         assert ta.intraday_bb_width == 0.0
 
+    def test_vol_min_samples_makes_short_history_abstain_structurally(self) -> None:
+        # Simulates an SPCX-style asset: real daily history exists but is
+        # well short of a calibrated threshold (SPCX_MIN_DAILY_CANDLES=50 in
+        # the bot). Without an explicit vol_min_samples lever,
+        # compute_ta_state has no way to force an abstention here — it
+        # would happily rank against whatever rolling-width history exists.
+        daily = make_candles([100.0 + i * 0.5 for i in range(30)])
+        intraday = make_candles([500.0] * 10)
+
+        # Default vol_min_samples=2: 30 daily candles at bb_period=20 (SPY
+        # default) yields an 11-element rolling widths series — comfortably
+        # >= 2, so a real (non-None) rank is produced today.
+        ta_default = compute_ta_state(intraday, daily, vol_lookback=50)
+        assert ta_default.bb_width_pct is not None
+
+        # Calibrated vol_min_samples=50 (mirroring SPCX_MIN_DAILY_CANDLES):
+        # the identical candle history now structurally abstains instead of
+        # guessing — this is a caller lever, not an incidental side effect
+        # of today's candle count.
+        ta_calibrated = compute_ta_state(
+            intraday, daily, vol_lookback=50, vol_min_samples=50
+        )
+        assert ta_calibrated.bb_width_pct is None
+
     def test_bb_width_pct_survives_zero_mean_window_in_history(self) -> None:
         # Some historical rolling windows have mean == 0 (calculate_bb's
         # middle==0 guard fires -> 0.0 width for that position). Ranking
