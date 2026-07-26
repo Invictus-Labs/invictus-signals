@@ -133,6 +133,29 @@ def bbwp(
           ranks floats — it does not validate width semantics — so a
           negative value (or any float) compares and ranks normally.
 
+    Caller responsibility — the one property this function CANNOT check
+    and CANNOT return an error for, because a violation still produces a
+    clean, in-range float that looks exactly like a valid rank:
+        **The window must actually span more than one volatility regime.**
+        A rank is only informative if the trailing window contains both
+        compressed and expanded periods to rank the target against. If the
+        whole window sits inside one regime (e.g. a lookback short enough
+        that it only ever sees the tail end of a single sustained move),
+        the rank degenerates into noise — dominated by tiny variations in a
+        near-constant series, uniformly distributed 0-100 with no signal,
+        rather than by anything a downstream COMPRESSED/EXTENDED cut should
+        act on. Verified empirically: a monotonically-rising width series
+        breaking out of flat compression reads 100.0 from day one of the
+        rise and stays pinned there for the whole leg — not a bug in this
+        function or a consequence of the strictly-less-than convention
+        above (a less-or-equal convention does the same), but a direct
+        consequence of a window whose composition never changed regime.
+        This is exactly why the lookback is caller-supplied rather than
+        fixed: a daily-bar lookback and an intraday-bar lookback need
+        different bar-counts to span a comparable economic window, and
+        picking one number for both (rather than calibrating each) is a
+        common way to violate this property silently.
+
     Args:
         widths: Historical bandwidth series (e.g. `TAState.bb_width` values
             over time), most-recent last. The last element is the one being
@@ -421,6 +444,7 @@ def compute_ta_state(
     daily_candles: Sequence[Candle],
     config: AssetConfig | None = None,
     vol_lookback: int | None = None,
+    intraday_vol_lookback: int | None = None,
     vol_min_samples: int = 2,
 ) -> TAState:
     """Compute the full TAState from intraday + daily candle history.
@@ -433,16 +457,25 @@ def compute_ta_state(
         candles: Intraday bars for the current session (most-recent last).
         daily_candles: Daily OHLCV bars (most-recent last).
         config: Asset configuration. Defaults to SPY preset.
-        vol_lookback: Trailing window for the BBWP percentile rank
-            (`bbwp()`), applied to BOTH `bb_width_pct` (daily) and
-            `intraday_bb_width_pct` (intraday) — mirroring how
-            `intraday_bb_upper`/`intraday_bb_lower` reuse the daily
-            `bb_period`/`bb_std_dev` rather than inventing a second
-            constant. **No default is hardcoded here** — per-asset
-            calibration is a bot-level decision (PRD D-2); when omitted
-            (`None`, the default), both `_pct` fields stay `None` and this
-            function's behavior for every existing field is unchanged from
-            before this parameter existed (additive-only, AC-6).
+        vol_lookback: Trailing window for `bb_width_pct` (the DAILY BBWP
+            rank) — one bar = one day. **No default is hardcoded here** —
+            per-asset calibration is a bot-level decision (PRD D-2); when
+            omitted (`None`, the default), `bb_width_pct` stays `None` and
+            this function's behavior for every existing field is unchanged
+            from before this parameter existed (additive-only, AC-6).
+        intraday_vol_lookback: Trailing window for `intraday_bb_width_pct`
+            (the INTRADAY BBWP rank) — one bar = whatever timeframe
+            *candles* is (1H, 15M, ...). **Deliberately separate from
+            `vol_lookback`, not a shared/reused value.** One integer cannot
+            serve both lenses: `vol_lookback=252` means ~1 year on daily
+            bars but ~10.5 days on 1H bars or ~2.6 days on 15M bars — a
+            window that short on 15M almost never spans both a compressed
+            and an expanded regime, so the rank it produces is
+            noise-dominated (see `bbwp()`'s docstring on regime-spanning).
+            Defaults to `None`, meaning "don't compute the intraday rank"
+            — it does **not** silently fall back to `vol_lookback`, because
+            a plausible-looking number computed on the wrong timeframe's
+            scale is worse than an honest `None`.
         vol_min_samples: Forwarded to `bbwp()`'s `min_samples` for both
             percentile calls. Defaults to `bbwp()`'s own floor (2) — pure
             passthrough, not a second default invented here. Exists so an
@@ -540,23 +573,25 @@ def compute_ta_state(
         intraday_bb_width = 0.0
 
     # --- Bandwidth percentiles (BBWP, additive — four-layer-order PRD Phase 1).
-    # Only attempted when the caller supplies a lookback; otherwise both stay
-    # None (see vol_lookback's docstring). Ranks the FINAL element of a
-    # rolling widths series built from calculate_bb at every trailing
-    # position, so the target being ranked is always identical to bb["width"]
-    # / intraday_bb["width"] above — never a second, divergent computation.
+    # Each lens only attempted when the caller supplies ITS OWN lookback;
+    # otherwise it stays None (see vol_lookback/intraday_vol_lookback's
+    # docstrings — deliberately two separate params, never one reused for
+    # both scales). Ranks the FINAL element of a rolling widths series built
+    # from calculate_bb at every trailing position, so the target being
+    # ranked is always identical to bb["width"] / intraday_bb["width"]
+    # above — never a second, divergent computation.
     if vol_lookback is not None and bb_period >= 2:
         daily_widths = _rolling_bb_widths(daily_closes, bb_period, cfg.bb_std_dev)
         bb_width_pct = bbwp(daily_widths, vol_lookback, min_samples=vol_min_samples)
     else:
         bb_width_pct = None
 
-    if vol_lookback is not None and intraday_bb_period >= 2:
+    if intraday_vol_lookback is not None and intraday_bb_period >= 2:
         intraday_widths = _rolling_bb_widths(
             intraday_closes, intraday_bb_period, cfg.bb_std_dev
         )
         intraday_bb_width_pct = bbwp(
-            intraday_widths, vol_lookback, min_samples=vol_min_samples
+            intraday_widths, intraday_vol_lookback, min_samples=vol_min_samples
         )
     else:
         intraday_bb_width_pct = None

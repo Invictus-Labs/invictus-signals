@@ -161,6 +161,51 @@ class TestBBWP:
         assert bbwp([1.0], lookback=5) is None
         assert bbwp([1.0, 2.0], lookback=5) is not None
 
+    def test_regime_spanning_monotonic_breakout_pins_to_100_from_day_one(self) -> None:
+        # Documents a property callers MUST design around (see the docstring's
+        # "Caller responsibility" section) — this is expected behavior, not a
+        # bug, and this test exists so a future change doesn't silently "fix"
+        # it in a way that breaks the documented contract. A trailing-window
+        # percentile rank is only informative if the window spans more than
+        # one regime; a monotonic rise breaking out of a flat, unchanging
+        # floor reads as the window's maximum on EVERY bar of the rise, not
+        # just at its exhausted end, because each new bar is compared only
+        # against the (all-lower) flat floor and the (also-lower) earlier
+        # bars of the same rise.
+        flat = [0.05] * 50
+        rising = [0.05 + (i + 1) * 0.01 for i in range(10)]
+        series = flat + rising
+        for i in range(1, 11):
+            widths_so_far = series[: 50 + i]
+            assert bbwp(widths_so_far, lookback=60) == pytest.approx(100.0)
+
+    def test_regime_spanning_prior_cycle_in_lookback_produces_a_graduated_rank(
+        self,
+    ) -> None:
+        # The counterpart to the test above: when the lookback ALREADY
+        # contains a comparable prior expansion/contraction cycle (not just
+        # flat history), the same new rise is ranked against real variation
+        # and produces a graduated climb rather than an instant pin to 100 —
+        # confirming the pinning above is about window composition, not a
+        # defect in the rank formula.
+        prior_cycle = [0.05 + i * 0.02 for i in range(15)] + [
+            0.35 - i * 0.02 for i in range(15)
+        ]
+        calm = [0.05] * 20
+        history = prior_cycle + calm  # 50 bars, containing one full cycle up to 0.35
+        new_rise = [0.05 + (i + 1) * 0.0125 for i in range(20)]  # peaks at 0.30
+        series = history + new_rise
+
+        percentiles = [
+            bbwp(series[: 50 + i], lookback=70) for i in range(1, 21)
+        ]
+        assert all(p is not None for p in percentiles)
+        # Graduated, not instantly pinned: the first day of the new rise is
+        # well below 100 (it's still smaller than the prior cycle's peak),
+        # and later days climb higher as the rise approaches/exceeds it.
+        assert percentiles[0] < 90.0
+        assert percentiles[0] < percentiles[-1]
+
     def test_stdlib_only_no_new_imports(self) -> None:
         import invictus_signals.ta_engine as ta_mod
 
@@ -543,10 +588,34 @@ class TestComputeTAState:
         daily = make_candles([80_000 + i * 50 for i in range(30)])
         intraday_prices = [100.0 + i for i in range(20)]
         intraday = make_candles(intraday_prices)
-        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
+        ta = compute_ta_state(intraday, daily, config=cfg, intraday_vol_lookback=10)
         expected = bbwp(_rolling_bb_widths(intraday_prices, 5, cfg.bb_std_dev), 10)
         assert expected is not None
         assert ta.intraday_bb_width_pct == expected
+
+    def test_vol_lookback_does_not_silently_feed_the_intraday_lens(self) -> None:
+        # Regression for the "one lookback can't serve both lenses" defect:
+        # a daily-scale lookback and an intraday-scale lookback span wildly
+        # different economic windows (see bbwp()'s regime-spanning note), so
+        # supplying ONLY vol_lookback must NOT produce a plausible-looking
+        # intraday_bb_width_pct computed on the wrong timeframe's scale —
+        # it must stay None until intraday_vol_lookback is supplied too.
+        cfg = get_config("BTC", bb_period=5)
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday = make_candles([100.0 + i for i in range(20)])
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
+        assert ta.bb_width_pct is not None  # daily lens is fed
+        assert ta.intraday_bb_width_pct is None  # intraday lens is NOT fed
+
+    def test_intraday_vol_lookback_does_not_silently_feed_the_daily_lens(self) -> None:
+        # The symmetric case: supplying ONLY intraday_vol_lookback must not
+        # feed bb_width_pct either — each lens requires its own parameter.
+        cfg = get_config("BTC", bb_period=5)
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday = make_candles([100.0 + i for i in range(20)])
+        ta = compute_ta_state(intraday, daily, config=cfg, intraday_vol_lookback=10)
+        assert ta.bb_width_pct is None
+        assert ta.intraday_bb_width_pct is not None
 
     def test_bb_width_pct_none_when_daily_history_too_short_for_a_band(self) -> None:
         # bb_period caps at n_daily=1 (<2) -> no band at all -> None even
@@ -557,9 +626,11 @@ class TestComputeTAState:
         assert ta.bb_width_pct is None
 
     def test_intraday_bb_width_pct_none_with_single_intraday_candle(self) -> None:
+        # intraday_vol_lookback IS supplied here — the None must be caused
+        # by intraday_bb_period < 2 (single candle), not by a missing param.
         daily = make_candles([500.0 + i * 0.3 for i in range(30)])
         intraday = make_candles([500.0])
-        ta = compute_ta_state(intraday, daily, vol_lookback=50)
+        ta = compute_ta_state(intraday, daily, intraday_vol_lookback=50)
         assert ta.intraday_bb_width_pct is None
         assert ta.intraday_bb_width == 0.0
 
@@ -601,12 +672,20 @@ class TestComputeTAState:
 
     def test_additive_only_existing_fields_unchanged_by_vol_lookback(self) -> None:
         # AC-6: every existing TAState field keeps its current value —
-        # passing vol_lookback may only populate the three new fields.
+        # passing vol_lookback/intraday_vol_lookback/vol_min_samples may
+        # only populate the three new fields.
         daily = make_candles([500.0 + i * 0.3 for i in range(60)])
         intraday = make_candles([501.0 + (i % 5) * 0.1 for i in range(60)])
         cfg = get_config("SPY")
         without = compute_ta_state(intraday, daily, config=cfg)
-        with_lookback = compute_ta_state(intraday, daily, config=cfg, vol_lookback=20)
+        with_lookback = compute_ta_state(
+            intraday,
+            daily,
+            config=cfg,
+            vol_lookback=20,
+            intraday_vol_lookback=15,
+            vol_min_samples=3,
+        )
         new_fields = {"bb_width_pct", "intraday_bb_width", "intraday_bb_width_pct"}
         for f in dataclasses.fields(TAState):
             if f.name in new_fields:
