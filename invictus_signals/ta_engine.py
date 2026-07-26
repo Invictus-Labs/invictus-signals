@@ -515,20 +515,32 @@ def compute_ta_state(
 
     Args:
         candles: Intraday bars (most-recent last). Historically documented
-            as "the current session" (true for VWAP/volume-MA, which want
-            exactly that), but if `intraday_vol_lookback` is supplied, this
-            same series is also what `intraday_bb_width_pct` ranks against —
-            and per `bbwp()`'s regime-spanning requirement, a rank needs
-            enough bars to span more than one volatility regime, which a
-            single session almost never does (code-review finding,
-            2026-07-26, cross-corroborated by two independent reviewers: a
-            literal "current session" `candles` argument would silently
-            produce a noise-dominated or permanently-`None` intraday rank).
-            **When arming `intraday_vol_lookback`, pass a multi-session
-            historical intraday buffer here, not just today's bars** — this
-            function does not and cannot detect the difference; a caller
-            that only ever has session-scoped candles should leave
-            `intraday_vol_lookback` unset rather than rank a single session.
+            as "the current session," which is exactly what `vwap` wants
+            (`calculate_vwap` has no internal windowing — it averages the
+            ENTIRE sequence handed to it, unlike `intraday_ma_fast`/
+            `intraday_ma_mid`/`intraday_adx`, which all internally window to
+            a bounded trailing slice regardless of how much history they're
+            given). If `intraday_vol_lookback` is armed, this SAME series is
+            also what `intraday_bb_width_pct` ranks against, and per
+            `bbwp()`'s regime-spanning requirement, a rank needs enough bars
+            to span more than one volatility regime — a single session
+            almost never does (code-review finding, 2026-07-26).
+            **These two requirements are in genuine, unresolved tension, not
+            a documentation nit (QA-swarm finding, cross-model verified,
+            2026-07-26):** widening `candles` to a multi-session buffer
+            makes `intraday_bb_width_pct` meaningful but silently makes
+            `vwap` a multi-session average instead of a session VWAP — this
+            function has no way to serve both from one argument. It is NOT
+            introduced by this parameter: any existing caller already
+            passing a multi-bar rolling buffer here (rather than literally
+            resetting at session boundaries) already has this exact
+            trade-off today, with or without `intraday_vol_lookback` — this
+            parameter only makes the trade-off visible by giving a reason to
+            widen the buffer on purpose. Resolving it properly (e.g. a
+            second, dedicated historical-only intraday series) is an
+            architecture change outside this PR's additive-only scope — a
+            caller arming `intraday_vol_lookback` today is choosing to
+            accept `vwap`'s scope widening, not avoiding a cost.
         daily_candles: Daily OHLCV bars (most-recent last).
         config: Asset configuration. Defaults to SPY preset.
         vol_lookback: Trailing window for `bb_width_pct` (the DAILY BBWP
@@ -675,7 +687,18 @@ def compute_ta_state(
     # shorter than needed — `closes[-needed:]` on a shorter list returns the
     # whole list unchanged, so nothing is lost when there's less history
     # than the caller's lookback asks for.
-    if vol_lookback is not None and bb_period >= 2:
+    #
+    # The `> 1` conjunct (QA-swarm finding, 2026-07-26, cross-model): a
+    # `vol_lookback` bbwp() will reject anyway (<=1, including negative)
+    # used to still compute `daily_needed = vol_lookback + bb_period - 1`,
+    # which goes to 0 or negative for a sufficiently negative lookback —
+    # `daily_closes[-0:]` is the WHOLE list, not an empty one, so an
+    # obviously-invalid lookback silently ran the full-history rolling-width
+    # scan anyway before bbwp() discarded it. Measured 8.6x slower
+    # (0.330s vs 0.038s) on a 200k-candle series for a pathological
+    # `vol_lookback=-19`. Rejecting `lookback<=1` here, before doing any
+    # work, mirrors bbwp()'s own guard instead of relying on it downstream.
+    if vol_lookback is not None and vol_lookback > 1 and bb_period >= 2:
         daily_needed = vol_lookback + bb_period - 1
         daily_widths = _rolling_bb_widths(
             daily_closes[-daily_needed:], bb_period, cfg.bb_std_dev
@@ -684,7 +707,11 @@ def compute_ta_state(
     else:
         bb_width_pct = None
 
-    if intraday_vol_lookback is not None and intraday_bb_period >= 2:
+    if (
+        intraday_vol_lookback is not None
+        and intraday_vol_lookback > 1
+        and intraday_bb_period >= 2
+    ):
         intraday_needed = intraday_vol_lookback + intraday_bb_period - 1
         intraday_widths = _rolling_bb_widths(
             intraday_closes[-intraday_needed:], intraday_bb_period, cfg.bb_std_dev

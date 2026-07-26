@@ -774,6 +774,28 @@ class TestComputeTAState:
         ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
         assert ta.bb_width_pct == pytest.approx(50.0)
 
+    def test_invalid_negative_lookback_skips_the_full_history_scan(self) -> None:
+        # QA-swarm finding (2026-07-26, cross-model): a vol_lookback that
+        # bbwp() will reject anyway (<=1, including negative) used to still
+        # compute daily_needed = vol_lookback + bb_period - 1, which goes to
+        # 0 or negative for a sufficiently negative lookback --
+        # closes[-0:] is the WHOLE list, not empty, so an obviously-invalid
+        # lookback silently ran the full-history rolling-width scan before
+        # bbwp() discarded it. Measured 8.6x slower on a 200k-candle series
+        # for vol_lookback=-19 at bb_period=20 before this guard existed.
+        # This test pins correctness (still None); the performance
+        # characteristic isn't asserted here (flake risk) but was verified
+        # manually — see the PR/QA report for the measured numbers.
+        cfg = get_config("BTC", bb_period=20)
+        daily = make_candles([100.0 + (i % 7) for i in range(300)])
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=-19)
+        assert ta.bb_width_pct is None
+        ta_intraday = compute_ta_state(
+            intraday, daily, config=cfg, intraday_vol_lookback=-19
+        )
+        assert ta_intraday.intraday_bb_width_pct is None
+
     def test_additive_only_existing_fields_unchanged_by_vol_lookback(self) -> None:
         # AC-6: every existing TAState field keeps its current value —
         # passing vol_lookback/intraday_vol_lookback/vol_min_samples may
