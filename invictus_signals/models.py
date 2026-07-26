@@ -177,17 +177,34 @@ class TAState:
     #   bb_width_pct          — percentile of the DAILY bandwidth (regime-scale,
     #                            "is the daily leg coiled or spent").
     #   intraday_bb_width      — normalized INTRADAY bandwidth, same (u-l)/mid
-    #                            form as bb_width, just computed on the
-    #                            intraday closes. No lookback needed — it is
-    #                            the current snapshot, not a rank.
+    #                            FORMULA as bb_width (not the same MAGNITUDE —
+    #                            see below), computed on the intraday closes.
+    #                            No lookback needed — it is the current
+    #                            snapshot, not a rank.
     #   intraday_bb_width_pct  — percentile of the INTRADAY bandwidth
     #                            (entry-scale, what dnt_16-style consumers on
     #                            the 15m/1h timeframe should key off).
     # None on the two `_pct` fields means "not computed" — either the caller
     # didn't supply a lookback, or `bbwp()` returned None (see its docstring
-    # for the sad paths: insufficient history, lookback<=1, NaN target).
-    # Never interpolated or guessed. 0.0 on `intraday_bb_width` is the same
-    # "absent" sentinel already used by intraday_bb_upper/lower.
+    # for the sad paths: insufficient history, lookback<=1, non-finite target).
+    # Never interpolated or guessed.
+    #
+    # `intraday_bb_width`'s 0.0 is NOT an "absent" sentinel a consumer can
+    # gate on (code-review finding, 2026-07-26 — corrects an earlier,
+    # incorrect version of this comment that claimed it was): a fully flat
+    # intraday window legitimately computes to 0.0 too (sigma=0, or
+    # calculate_bb's middle==0 guard), so `intraday_bb_width == 0.0` cannot
+    # be told apart from "no intraday data" by the value alone — and 0.0 is
+    # exactly the deepest-coil reading this field exists to surface, so
+    # misreading it as "absent" would discard the single most useful state.
+    # Presence for the whole intraday-BB group is keyed SOLELY off
+    # `intraday_bb_upper > 0.0` (per the block above) — never off
+    # `intraday_bb_width` itself. `intraday_bb_width` and `bb_width` also use
+    # different periods whenever `bb_period` is capped differently by daily
+    # vs. intraday history depth (`min(cfg.bb_period, n_daily)` vs.
+    # `min(cfg.bb_period, n_intraday)`), so the two raw magnitudes are not
+    # directly comparable/differenceable — only their respective `_pct` ranks
+    # are cross-comparable.
     bb_width_pct: float | None = None
     intraday_bb_width: float = 0.0
     intraday_bb_width_pct: float | None = None

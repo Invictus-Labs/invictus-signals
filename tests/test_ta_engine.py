@@ -147,6 +147,29 @@ class TestBBWP:
         widths = [float("nan"), float("nan"), 5.0]
         assert bbwp(widths, lookback=3) is None
 
+    def test_positive_infinity_target_returns_none(self) -> None:
+        # Regression (code-review-swarm, 2026-07-26, cross-corroborated by
+        # 3 independent reviewers): the target guard used to check only
+        # isnan, so an overflowed/invalid +inf width read as a confident
+        # 100.0 (a plausible-looking number from garbage input) instead of
+        # the honest None the docstring promises for every sad path.
+        assert bbwp([1.0, 2.0, float("inf")], lookback=3) is None
+
+    def test_negative_infinity_target_returns_none(self) -> None:
+        assert bbwp([1.0, 2.0, float("-inf")], lookback=3) is None
+
+    def test_min_samples_le_zero_returns_none_not_indexerror(self) -> None:
+        # Regression (code-review-swarm, 2026-07-26, independently reproduced
+        # by 4 reviewers): len(widths) < min_samples is never true for an
+        # empty widths list when min_samples <= 0 (e.g. 0 < 0 is False), so
+        # a caller-supplied non-positive min_samples used to slip past the
+        # length guard entirely and crash on window[-1] with an empty
+        # widths list. bbwp() is a public function (other consumers per
+        # this repo's CLAUDE.md) with no validation on min_samples, so this
+        # was reachable from outside compute_ta_state's own safe usage.
+        assert bbwp([], lookback=50, min_samples=0) is None
+        assert bbwp([], lookback=50, min_samples=-5) is None
+
     def test_negative_widths_rank_normally(self) -> None:
         widths = [-5.0, -3.0, -1.0]
         assert bbwp(widths, lookback=3) == pytest.approx(100.0)
