@@ -75,6 +75,26 @@ class TestTAState:
         assert ta.atr == 0.0
         assert ta.atr_pct == 0.0
 
+    def test_bandwidth_percentile_fields_default_to_absent(self) -> None:
+        # QA-swarm finding (2026-07-26): compute_ta_state's own tests always
+        # pass these 3 fields explicitly, so they never exercise the
+        # dataclass-level DEFAULT — a regression that flips
+        # intraday_bb_width_pct's default from None to 0.0 (turning "not
+        # computed" into "0th percentile / maximally compressed", the
+        # strongest signal this field can emit) would pass the entire suite
+        # undetected. Uses `is None`, never a falsy/truthiness check, so a
+        # 0.0 default fails loudly rather than silently comparing equal.
+        ta = TAState(
+            ma_fast=100.0, ma_mid=100.0, ma_slow=100.0,
+            ma_fast_slope=0.0, ma_mid_slope=0.0,
+            bb_upper=105.0, bb_lower=95.0, bb_middle=100.0,
+            bb_width=0.1, bb_upper_slope=0.0,
+            volume_ma=1000.0, vwap=100.0,
+        )
+        assert ta.bb_width_pct is None
+        assert ta.intraday_bb_width_pct is None
+        assert ta.intraday_bb_width == 0.0
+
     def test_extended_fields_custom(self) -> None:
         ta = TAState(
             ma_fast=100.0, ma_mid=100.0, ma_slow=100.0,

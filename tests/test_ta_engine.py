@@ -23,6 +23,24 @@ from invictus_signals.ta_engine import (
 from tests.conftest import make_candles
 
 
+def _oscillating_prices(n: int) -> list[float]:
+    """A deterministic, non-monotone price series with compression/expansion
+    cycles (period-3 direction reversal), for tests that need bandwidth to
+    actually vary across a trailing window rather than moving strictly in
+    one direction. A monotone-linear series makes width strictly monotone
+    too (constant sigma, moving mean), so the *target* is always the
+    window's unique min or max regardless of which window was selected —
+    degenerate for any test that needs to prove a specific lookback/window
+    was used, not just that *a* window was (QA-swarm finding, 2026-07-26).
+    """
+    prices = []
+    p = 100.0
+    for i in range(n):
+        p += 3.0 * ((-1) ** (i // 3)) + 0.1 * (i % 3)
+        prices.append(p)
+    return prices
+
+
 # ---------------------------------------------------------------------------
 # calculate_sma
 # ---------------------------------------------------------------------------
@@ -597,24 +615,64 @@ class TestComputeTAState:
         assert ta.intraday_bb_width == 0.0
 
     def test_bb_width_pct_matches_manual_bbwp_over_rolling_widths(self) -> None:
+        # QA-swarm finding (2026-07-26): a monotone-linear price series makes
+        # width strictly decreasing (constant sigma, rising mean), so the
+        # ranked target is always the unique minimum of ANY trailing window
+        # -> both sides of this assertion evaluate to 0.0 regardless of
+        # which window compute_ta_state actually selected. That made this
+        # test blind to a real wiring bug (e.g. the daily_needed pre-slice
+        # arithmetic silently ranking the wrong window) -- 0.0 == 0.0 either
+        # way. _oscillating_prices() has compression/expansion cycles, so
+        # different lookback windows produce genuinely different, non-
+        # boundary ranks (verified: lookback=10 -> ~66.7, lookback=5 -> 75.0,
+        # lookback=20 -> ~63.2 -- all distinct), making the wiring this test
+        # exists to check actually load-bearing.
         cfg = get_config("BTC", bb_period=5)
-        prices = [100.0 + i for i in range(30)]
+        prices = _oscillating_prices(40)
         daily = make_candles(prices)
         intraday = make_candles([500.0] * 10)
         ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
         expected = bbwp(_rolling_bb_widths(prices, 5, cfg.bb_std_dev), 10)
         assert expected is not None
+        assert 0.0 < expected < 100.0  # guard against silently degenerating again
         assert ta.bb_width_pct == expected
 
     def test_intraday_bb_width_pct_matches_manual_bbwp(self) -> None:
         cfg = get_config("BTC", bb_period=5)
         daily = make_candles([80_000 + i * 50 for i in range(30)])
-        intraday_prices = [100.0 + i for i in range(20)]
+        intraday_prices = _oscillating_prices(40)
         intraday = make_candles(intraday_prices)
         ta = compute_ta_state(intraday, daily, config=cfg, intraday_vol_lookback=10)
         expected = bbwp(_rolling_bb_widths(intraday_prices, 5, cfg.bb_std_dev), 10)
         assert expected is not None
+        assert 0.0 < expected < 100.0
         assert ta.intraday_bb_width_pct == expected
+
+    def test_both_lenses_armed_with_different_lookbacks_rank_independently(self) -> None:
+        # QA-swarm finding (2026-07-26): the cross-lens-fallback bug fixed in
+        # commit 2d0352e (bbwp(intraday_widths, vol_lookback OR
+        # intraday_vol_lookback, ...)) would previously only surface as a
+        # TypeError in tests that leave one lookback as None -- never as a
+        # wrong VALUE, since no test armed both lookbacks simultaneously with
+        # DIFFERENT values and checked which one the intraday lens actually
+        # used. This test does: vol_lookback=5 and intraday_vol_lookback=20
+        # on the same oscillating series produce different, hand-verified
+        # ranks (75.0 vs ~63.2) -- if the intraday lens ever fell back to
+        # vol_lookback, this would silently assert the wrong number instead
+        # of crashing.
+        cfg = get_config("BTC", bb_period=5)
+        prices = _oscillating_prices(40)
+        daily = make_candles(prices)
+        intraday = make_candles(prices)
+        ta = compute_ta_state(
+            intraday, daily, config=cfg, vol_lookback=5, intraday_vol_lookback=20
+        )
+        widths = _rolling_bb_widths(prices, 5, cfg.bb_std_dev)
+        expected_daily = bbwp(widths, 5)
+        expected_intraday = bbwp(widths, 20)
+        assert expected_daily != expected_intraday  # fixture sanity check
+        assert ta.bb_width_pct == expected_daily
+        assert ta.intraday_bb_width_pct == expected_intraday
 
     def test_vol_lookback_does_not_silently_feed_the_intraday_lens(self) -> None:
         # Regression for the "one lookback can't serve both lenses" defect:
@@ -681,17 +739,40 @@ class TestComputeTAState:
         )
         assert ta_calibrated.bb_width_pct is None
 
+    def test_vol_min_samples_makes_intraday_lens_abstain_structurally_too(
+        self,
+    ) -> None:
+        # QA-swarm finding (2026-07-26): the test above only pins
+        # vol_min_samples against the DAILY call (bb_width_pct) —
+        # deleting the `min_samples=vol_min_samples` passthrough on the
+        # INTRADAY call inside compute_ta_state would fail no test. This is
+        # the intraday mirror, proving the same structural-abstention lever
+        # works on intraday_bb_width_pct too.
+        daily = make_candles([500.0 + i * 0.3 for i in range(30)])
+        intraday = make_candles([100.0 + i * 0.5 for i in range(30)])
+
+        ta_default = compute_ta_state(intraday, daily, intraday_vol_lookback=50)
+        assert ta_default.intraday_bb_width_pct is not None
+
+        ta_calibrated = compute_ta_state(
+            intraday, daily, intraday_vol_lookback=50, vol_min_samples=50
+        )
+        assert ta_calibrated.intraday_bb_width_pct is None
+
     def test_bb_width_pct_survives_zero_mean_window_in_history(self) -> None:
         # Some historical rolling windows have mean == 0 (calculate_bb's
         # middle==0 guard fires -> 0.0 width for that position). Ranking
         # over the whole rolling series must not crash and must still
-        # return a valid 0-100 rank.
+        # return the correct rank. QA-swarm finding (2026-07-26): this
+        # fixture's rolling widths are [0.0, 0.0, 0.0, 5.812, 4.733, 1.789,
+        # 1.278] (hand-verified), which ranks to exactly 50.0 — asserting a
+        # wide 0-100 range instead of the exact value would pass even if the
+        # rank were wrong, so assert the precise number.
         cfg = get_config("BTC", bb_period=4)
         daily = make_candles([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0])
         intraday = make_candles([500.0] * 10)
         ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
-        assert ta.bb_width_pct is not None
-        assert 0.0 <= ta.bb_width_pct <= 100.0
+        assert ta.bb_width_pct == pytest.approx(50.0)
 
     def test_additive_only_existing_fields_unchanged_by_vol_lookback(self) -> None:
         # AC-6: every existing TAState field keeps its current value —
