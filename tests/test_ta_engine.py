@@ -20,7 +20,7 @@ from invictus_signals.ta_engine import (
     calculate_vwap,
     compute_ta_state,
 )
-from tests.conftest import make_candle, make_candles
+from tests.conftest import make_candles
 
 
 # ---------------------------------------------------------------------------
