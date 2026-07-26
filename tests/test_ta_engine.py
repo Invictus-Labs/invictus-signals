@@ -1,11 +1,15 @@
 """Tests for invictus_signals.ta_engine."""
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from invictus_signals.config import get_config
-from invictus_signals.models import Candle
+from invictus_signals.models import Candle, TAState
 from invictus_signals.ta_engine import (
+    _rolling_bb_widths,
+    bbwp,
     calculate_adx,
     calculate_atr,
     calculate_bb,
@@ -16,7 +20,25 @@ from invictus_signals.ta_engine import (
     calculate_vwap,
     compute_ta_state,
 )
-from tests.conftest import make_candle, make_candles
+from tests.conftest import make_candles
+
+
+def _oscillating_prices(n: int) -> list[float]:
+    """A deterministic, non-monotone price series with compression/expansion
+    cycles (period-3 direction reversal), for tests that need bandwidth to
+    actually vary across a trailing window rather than moving strictly in
+    one direction. A monotone-linear series makes width strictly monotone
+    too (constant sigma, moving mean), so the *target* is always the
+    window's unique min or max regardless of which window was selected —
+    degenerate for any test that needs to prove a specific lookback/window
+    was used, not just that *a* window was (QA-swarm finding, 2026-07-26).
+    """
+    prices = []
+    p = 100.0
+    for i in range(n):
+        p += 3.0 * ((-1) ** (i // 3)) + 0.1 * (i % 3)
+        prices.append(p)
+    return prices
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +99,196 @@ class TestCalculateBB:
     def test_raises_insufficient_data(self) -> None:
         with pytest.raises(ValueError, match="Need at least"):
             calculate_bb([1.0, 2.0], period=10)
+
+
+# ---------------------------------------------------------------------------
+# bbwp — percentile rank helper (four-layer-order PRD, AC-5)
+# ---------------------------------------------------------------------------
+
+class TestBBWP:
+    def test_fresh_all_time_high_reads_as_100(self) -> None:
+        # Strictly-increasing series -> final element is the unique max of
+        # the window -> strictly-less-than convention sends it to 100.0.
+        widths = [1.0, 2.0, 3.0, 4.0, 5.0]
+        assert bbwp(widths, lookback=5) == pytest.approx(100.0)
+
+    def test_fresh_all_time_low_reads_as_0(self) -> None:
+        widths = [5.0, 4.0, 3.0, 2.0, 1.0]
+        assert bbwp(widths, lookback=5) == pytest.approx(0.0)
+
+    def test_ranks_last_element_not_some_other_index(self) -> None:
+        # Middle-of-the-pack value at the end -> neither 0 nor 100.
+        widths = [1.0, 5.0, 2.0, 4.0, 3.0]
+        # window [1,5,2,4,3], target=3, comparable=[1,5,2,4] -> 2 (1,2) < 3
+        # -> 100 * 2/4 = 50.0
+        assert bbwp(widths, lookback=5) == pytest.approx(50.0)
+
+    def test_appending_a_new_max_changes_the_rank(self) -> None:
+        # Same window, but the caller passes a longer series ending in a new
+        # element -> proves it ranks the FINAL element, not a fixed index.
+        base = [1.0, 5.0, 2.0, 4.0, 3.0]
+        assert bbwp(base + [10.0], lookback=6) == pytest.approx(100.0)
+
+    def test_none_below_min_samples(self) -> None:
+        assert bbwp([1.0, 2.0], lookback=10, min_samples=5) is None
+
+    def test_none_at_exactly_min_samples_boundary_still_ranks(self) -> None:
+        # len(widths) == min_samples is NOT below the floor -> must rank.
+        assert bbwp([1.0, 2.0], lookback=10, min_samples=2) is not None
+
+    def test_degenerate_all_identical_widths_returns_50(self) -> None:
+        widths = [7.0, 7.0, 7.0, 7.0, 7.0]
+        assert bbwp(widths, lookback=5) == pytest.approx(50.0)
+
+    def test_ties_with_target_do_not_count_toward_numerator(self) -> None:
+        # Not fully degenerate: two ties at the target plus one strictly
+        # lower value. Strictly-less-than -> only the 4.0 counts.
+        widths = [4.0, 6.0, 6.0, 6.0]
+        # comparable=[4.0, 6.0, 6.0], target=6.0 -> only 4.0 < 6.0 -> 1/3
+        assert bbwp(widths, lookback=4) == pytest.approx(100.0 / 3.0)
+
+    def test_lookback_le_1_returns_none(self) -> None:
+        assert bbwp([1.0, 2.0, 3.0], lookback=1) is None
+        assert bbwp([1.0, 2.0, 3.0], lookback=0) is None
+
+    def test_nan_target_returns_none(self) -> None:
+        assert bbwp([1.0, 2.0, float("nan")], lookback=3) is None
+
+    def test_nan_elsewhere_in_window_is_excluded_not_counted(self) -> None:
+        # One NaN plus one real, lower comparison point. The NaN must not
+        # silently deflate the denominator into "1 of 2" (=50); it should be
+        # dropped entirely, leaving "1 of 1" (=100).
+        widths = [float("nan"), 1.0, 5.0]
+        assert bbwp(widths, lookback=3) == pytest.approx(100.0)
+
+    def test_all_other_elements_nan_returns_none(self) -> None:
+        widths = [float("nan"), float("nan"), 5.0]
+        assert bbwp(widths, lookback=3) is None
+
+    def test_positive_infinity_target_returns_none(self) -> None:
+        # Regression (code-review-swarm, 2026-07-26, cross-corroborated by
+        # 3 independent reviewers): the target guard used to check only
+        # isnan, so an overflowed/invalid +inf width read as a confident
+        # 100.0 (a plausible-looking number from garbage input) instead of
+        # the honest None the docstring promises for every sad path.
+        assert bbwp([1.0, 2.0, float("inf")], lookback=3) is None
+
+    def test_negative_infinity_target_returns_none(self) -> None:
+        assert bbwp([1.0, 2.0, float("-inf")], lookback=3) is None
+
+    def test_min_samples_le_zero_returns_none_not_indexerror(self) -> None:
+        # Regression (code-review-swarm, 2026-07-26, independently reproduced
+        # by 4 reviewers): len(widths) < min_samples is never true for an
+        # empty widths list when min_samples <= 0 (e.g. 0 < 0 is False), so
+        # a caller-supplied non-positive min_samples used to slip past the
+        # length guard entirely and crash on window[-1] with an empty
+        # widths list. bbwp() is a public function (other consumers per
+        # this repo's CLAUDE.md) with no validation on min_samples, so this
+        # was reachable from outside compute_ta_state's own safe usage.
+        assert bbwp([], lookback=50, min_samples=0) is None
+        assert bbwp([], lookback=50, min_samples=-5) is None
+
+    def test_negative_widths_rank_normally(self) -> None:
+        widths = [-5.0, -3.0, -1.0]
+        assert bbwp(widths, lookback=3) == pytest.approx(100.0)
+
+    def test_fewer_elements_than_lookback_ranks_within_available_window(self) -> None:
+        # lookback=252 requested, but only 4 samples exist (>= min_samples).
+        # Must degrade to the available window rather than returning None.
+        widths = [1.0, 2.0, 3.0, 4.0]
+        assert bbwp(widths, lookback=252, min_samples=2) == pytest.approx(100.0)
+
+    def test_default_min_samples_is_the_mathematical_floor_of_2(self) -> None:
+        assert bbwp([1.0], lookback=5) is None
+        assert bbwp([1.0, 2.0], lookback=5) is not None
+
+    def test_regime_spanning_monotonic_breakout_pins_to_100_from_day_one(self) -> None:
+        # Documents a property callers MUST design around (see the docstring's
+        # "Caller responsibility" section) — this is expected behavior, not a
+        # bug, and this test exists so a future change doesn't silently "fix"
+        # it in a way that breaks the documented contract. A trailing-window
+        # percentile rank is only informative if the window spans more than
+        # one regime; a monotonic rise breaking out of a flat, unchanging
+        # floor reads as the window's maximum on EVERY bar of the rise, not
+        # just at its exhausted end, because each new bar is compared only
+        # against the (all-lower) flat floor and the (also-lower) earlier
+        # bars of the same rise.
+        flat = [0.05] * 50
+        rising = [0.05 + (i + 1) * 0.01 for i in range(10)]
+        series = flat + rising
+        for i in range(1, 11):
+            widths_so_far = series[: 50 + i]
+            assert bbwp(widths_so_far, lookback=60) == pytest.approx(100.0)
+
+    def test_regime_spanning_prior_cycle_in_lookback_produces_a_graduated_rank(
+        self,
+    ) -> None:
+        # The counterpart to the test above: when the lookback ALREADY
+        # contains a comparable prior expansion/contraction cycle (not just
+        # flat history), the same new rise is ranked against real variation
+        # and produces a graduated climb rather than an instant pin to 100 —
+        # confirming the pinning above is about window composition, not a
+        # defect in the rank formula.
+        prior_cycle = [0.05 + i * 0.02 for i in range(15)] + [
+            0.35 - i * 0.02 for i in range(15)
+        ]
+        calm = [0.05] * 20
+        history = prior_cycle + calm  # 50 bars, containing one full cycle up to 0.35
+        new_rise = [0.05 + (i + 1) * 0.0125 for i in range(20)]  # peaks at 0.30
+        series = history + new_rise
+
+        percentiles = [
+            bbwp(series[: 50 + i], lookback=70) for i in range(1, 21)
+        ]
+        assert all(p is not None for p in percentiles)
+        # Graduated, not instantly pinned: the first day of the new rise is
+        # well below 100 (it's still smaller than the prior cycle's peak),
+        # and later days climb higher as the rise approaches/exceeds it.
+        assert percentiles[0] < 90.0
+        assert percentiles[0] < percentiles[-1]
+
+    def test_stdlib_only_no_new_imports(self) -> None:
+        import invictus_signals.ta_engine as ta_mod
+
+        banned = {"numpy", "scipy", "pandas", "statistics"}
+        module_names = {
+            getattr(v, "__name__", None)
+            for v in vars(ta_mod).values()
+            if isinstance(v, type(ta_mod))
+        }
+        assert not (module_names & banned)
+
+
+# ---------------------------------------------------------------------------
+# _rolling_bb_widths — private helper feeding bbwp() from compute_ta_state
+# ---------------------------------------------------------------------------
+
+class TestRollingBBWidths:
+    def test_last_element_matches_direct_calculate_bb(self) -> None:
+        closes = [100.0, 102.0, 98.0, 101.0, 99.0, 103.0, 97.0, 104.0]
+        widths = _rolling_bb_widths(closes, period=4, std_dev=2.0)
+        assert widths[-1] == pytest.approx(
+            calculate_bb(closes, period=4, std_dev=2.0)["width"]
+        )
+
+    def test_length_is_series_len_minus_period_plus_1(self) -> None:
+        closes = [float(i) for i in range(10)]
+        widths = _rolling_bb_widths(closes, period=4, std_dev=2.0)
+        assert len(widths) == 10 - 4 + 1
+
+    def test_returns_empty_for_period_below_2(self) -> None:
+        assert _rolling_bb_widths([1.0, 2.0, 3.0], period=1, std_dev=2.0) == []
+
+    def test_returns_empty_when_shorter_than_period(self) -> None:
+        assert _rolling_bb_widths([1.0, 2.0], period=5, std_dev=2.0) == []
+
+    def test_zero_mean_window_yields_zero_width_no_crash(self) -> None:
+        # A window whose mean is exactly 0 must reuse calculate_bb's
+        # middle==0 guard (0.0, never ZeroDivisionError) rather than
+        # re-deriving the normalization.
+        closes = [-1.0, 1.0, -1.0, 1.0]
+        widths = _rolling_bb_widths(closes, period=4, std_dev=2.0)
+        assert widths == [pytest.approx(0.0)]
 
 
 # ---------------------------------------------------------------------------
@@ -363,3 +575,245 @@ class TestComputeTAState:
         intraday = make_candles([501.0])
         ta = compute_ta_state(intraday, daily)
         assert ta.vwap > 0
+
+    # -----------------------------------------------------------------
+    # bb_width_pct / intraday_bb_width / intraday_bb_width_pct (AC-6)
+    # -----------------------------------------------------------------
+
+    def test_new_pct_fields_default_none_without_vol_lookback(self) -> None:
+        # Today's callers never pass vol_lookback — both percentile fields
+        # must stay None so nothing downstream sees a value it didn't ask for.
+        daily = make_candles([500.0 + i * 0.3 for i in range(30)])
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily)
+        assert ta.bb_width_pct is None
+        assert ta.intraday_bb_width_pct is None
+
+    def test_intraday_bb_width_populated_independent_of_vol_lookback(self) -> None:
+        # Unlike the two _pct fields, intraday_bb_width is a snapshot (no
+        # ranking needed) and is populated whether or not vol_lookback is
+        # supplied.
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday_prices = [100.0 + i for i in range(15)]
+        intraday = make_candles(intraday_prices)
+        cfg = get_config("BTC")
+        ta = compute_ta_state(intraday, daily, config=cfg)
+        expected = calculate_bb(
+            intraday_prices,
+            period=min(cfg.bb_period, len(intraday_prices)),
+            std_dev=cfg.bb_std_dev,
+        )["width"]
+        assert ta.intraday_bb_width == pytest.approx(expected)
+        assert ta.intraday_bb_width > 0.0
+
+    def test_intraday_bb_width_zero_sentinel_with_single_candle(self) -> None:
+        # Mirrors the existing intraday_bb_upper/lower sentinel: <2 intraday
+        # bars can't form a band, so the width sentinel is 0.0 too.
+        daily = make_candles([500.0] * 25)
+        intraday = make_candles([500.0])
+        ta = compute_ta_state(intraday, daily)
+        assert ta.intraday_bb_width == 0.0
+
+    def test_bb_width_pct_matches_manual_bbwp_over_rolling_widths(self) -> None:
+        # QA-swarm finding (2026-07-26): a monotone-linear price series makes
+        # width strictly decreasing (constant sigma, rising mean), so the
+        # ranked target is always the unique minimum of ANY trailing window
+        # -> both sides of this assertion evaluate to 0.0 regardless of
+        # which window compute_ta_state actually selected. That made this
+        # test blind to a real wiring bug (e.g. the daily_needed pre-slice
+        # arithmetic silently ranking the wrong window) -- 0.0 == 0.0 either
+        # way. _oscillating_prices() has compression/expansion cycles, so
+        # different lookback windows produce genuinely different, non-
+        # boundary ranks (verified: lookback=10 -> ~66.7, lookback=5 -> 75.0,
+        # lookback=20 -> ~63.2 -- all distinct), making the wiring this test
+        # exists to check actually load-bearing.
+        cfg = get_config("BTC", bb_period=5)
+        prices = _oscillating_prices(40)
+        daily = make_candles(prices)
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
+        expected = bbwp(_rolling_bb_widths(prices, 5, cfg.bb_std_dev), 10)
+        assert expected is not None
+        assert 0.0 < expected < 100.0  # guard against silently degenerating again
+        assert ta.bb_width_pct == expected
+
+    def test_intraday_bb_width_pct_matches_manual_bbwp(self) -> None:
+        cfg = get_config("BTC", bb_period=5)
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday_prices = _oscillating_prices(40)
+        intraday = make_candles(intraday_prices)
+        ta = compute_ta_state(intraday, daily, config=cfg, intraday_vol_lookback=10)
+        expected = bbwp(_rolling_bb_widths(intraday_prices, 5, cfg.bb_std_dev), 10)
+        assert expected is not None
+        assert 0.0 < expected < 100.0
+        assert ta.intraday_bb_width_pct == expected
+
+    def test_both_lenses_armed_with_different_lookbacks_rank_independently(self) -> None:
+        # QA-swarm finding (2026-07-26): the cross-lens-fallback bug fixed in
+        # commit 2d0352e (bbwp(intraday_widths, vol_lookback OR
+        # intraday_vol_lookback, ...)) would previously only surface as a
+        # TypeError in tests that leave one lookback as None -- never as a
+        # wrong VALUE, since no test armed both lookbacks simultaneously with
+        # DIFFERENT values and checked which one the intraday lens actually
+        # used. This test does: vol_lookback=5 and intraday_vol_lookback=20
+        # on the same oscillating series produce different, hand-verified
+        # ranks (75.0 vs ~63.2) -- if the intraday lens ever fell back to
+        # vol_lookback, this would silently assert the wrong number instead
+        # of crashing.
+        cfg = get_config("BTC", bb_period=5)
+        prices = _oscillating_prices(40)
+        daily = make_candles(prices)
+        intraday = make_candles(prices)
+        ta = compute_ta_state(
+            intraday, daily, config=cfg, vol_lookback=5, intraday_vol_lookback=20
+        )
+        widths = _rolling_bb_widths(prices, 5, cfg.bb_std_dev)
+        expected_daily = bbwp(widths, 5)
+        expected_intraday = bbwp(widths, 20)
+        assert expected_daily != expected_intraday  # fixture sanity check
+        assert ta.bb_width_pct == expected_daily
+        assert ta.intraday_bb_width_pct == expected_intraday
+
+    def test_vol_lookback_does_not_silently_feed_the_intraday_lens(self) -> None:
+        # Regression for the "one lookback can't serve both lenses" defect:
+        # a daily-scale lookback and an intraday-scale lookback span wildly
+        # different economic windows (see bbwp()'s regime-spanning note), so
+        # supplying ONLY vol_lookback must NOT produce a plausible-looking
+        # intraday_bb_width_pct computed on the wrong timeframe's scale —
+        # it must stay None until intraday_vol_lookback is supplied too.
+        cfg = get_config("BTC", bb_period=5)
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday = make_candles([100.0 + i for i in range(20)])
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
+        assert ta.bb_width_pct is not None  # daily lens is fed
+        assert ta.intraday_bb_width_pct is None  # intraday lens is NOT fed
+
+    def test_intraday_vol_lookback_does_not_silently_feed_the_daily_lens(self) -> None:
+        # The symmetric case: supplying ONLY intraday_vol_lookback must not
+        # feed bb_width_pct either — each lens requires its own parameter.
+        cfg = get_config("BTC", bb_period=5)
+        daily = make_candles([80_000 + i * 50 for i in range(30)])
+        intraday = make_candles([100.0 + i for i in range(20)])
+        ta = compute_ta_state(intraday, daily, config=cfg, intraday_vol_lookback=10)
+        assert ta.bb_width_pct is None
+        assert ta.intraday_bb_width_pct is not None
+
+    def test_bb_width_pct_none_when_daily_history_too_short_for_a_band(self) -> None:
+        # bb_period caps at n_daily=1 (<2) -> no band at all -> None even
+        # though the caller supplied a lookback.
+        daily = make_candles([500.0])
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily, vol_lookback=50)
+        assert ta.bb_width_pct is None
+
+    def test_intraday_bb_width_pct_none_with_single_intraday_candle(self) -> None:
+        # intraday_vol_lookback IS supplied here — the None must be caused
+        # by intraday_bb_period < 2 (single candle), not by a missing param.
+        daily = make_candles([500.0 + i * 0.3 for i in range(30)])
+        intraday = make_candles([500.0])
+        ta = compute_ta_state(intraday, daily, intraday_vol_lookback=50)
+        assert ta.intraday_bb_width_pct is None
+        assert ta.intraday_bb_width == 0.0
+
+    def test_vol_min_samples_makes_short_history_abstain_structurally(self) -> None:
+        # Simulates an SPCX-style asset: real daily history exists but is
+        # well short of a calibrated threshold (SPCX_MIN_DAILY_CANDLES=50 in
+        # the bot). Without an explicit vol_min_samples lever,
+        # compute_ta_state has no way to force an abstention here — it
+        # would happily rank against whatever rolling-width history exists.
+        daily = make_candles([100.0 + i * 0.5 for i in range(30)])
+        intraday = make_candles([500.0] * 10)
+
+        # Default vol_min_samples=2: 30 daily candles at bb_period=20 (SPY
+        # default) yields an 11-element rolling widths series — comfortably
+        # >= 2, so a real (non-None) rank is produced today.
+        ta_default = compute_ta_state(intraday, daily, vol_lookback=50)
+        assert ta_default.bb_width_pct is not None
+
+        # Calibrated vol_min_samples=50 (mirroring SPCX_MIN_DAILY_CANDLES):
+        # the identical candle history now structurally abstains instead of
+        # guessing — this is a caller lever, not an incidental side effect
+        # of today's candle count.
+        ta_calibrated = compute_ta_state(
+            intraday, daily, vol_lookback=50, vol_min_samples=50
+        )
+        assert ta_calibrated.bb_width_pct is None
+
+    def test_vol_min_samples_makes_intraday_lens_abstain_structurally_too(
+        self,
+    ) -> None:
+        # QA-swarm finding (2026-07-26): the test above only pins
+        # vol_min_samples against the DAILY call (bb_width_pct) —
+        # deleting the `min_samples=vol_min_samples` passthrough on the
+        # INTRADAY call inside compute_ta_state would fail no test. This is
+        # the intraday mirror, proving the same structural-abstention lever
+        # works on intraday_bb_width_pct too.
+        daily = make_candles([500.0 + i * 0.3 for i in range(30)])
+        intraday = make_candles([100.0 + i * 0.5 for i in range(30)])
+
+        ta_default = compute_ta_state(intraday, daily, intraday_vol_lookback=50)
+        assert ta_default.intraday_bb_width_pct is not None
+
+        ta_calibrated = compute_ta_state(
+            intraday, daily, intraday_vol_lookback=50, vol_min_samples=50
+        )
+        assert ta_calibrated.intraday_bb_width_pct is None
+
+    def test_bb_width_pct_survives_zero_mean_window_in_history(self) -> None:
+        # Some historical rolling windows have mean == 0 (calculate_bb's
+        # middle==0 guard fires -> 0.0 width for that position). Ranking
+        # over the whole rolling series must not crash and must still
+        # return the correct rank. QA-swarm finding (2026-07-26): this
+        # fixture's rolling widths are [0.0, 0.0, 0.0, 5.812, 4.733, 1.789,
+        # 1.278] (hand-verified), which ranks to exactly 50.0 — asserting a
+        # wide 0-100 range instead of the exact value would pass even if the
+        # rank were wrong, so assert the precise number.
+        cfg = get_config("BTC", bb_period=4)
+        daily = make_candles([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=10)
+        assert ta.bb_width_pct == pytest.approx(50.0)
+
+    def test_invalid_negative_lookback_skips_the_full_history_scan(self) -> None:
+        # QA-swarm finding (2026-07-26, cross-model): a vol_lookback that
+        # bbwp() will reject anyway (<=1, including negative) used to still
+        # compute daily_needed = vol_lookback + bb_period - 1, which goes to
+        # 0 or negative for a sufficiently negative lookback --
+        # closes[-0:] is the WHOLE list, not empty, so an obviously-invalid
+        # lookback silently ran the full-history rolling-width scan before
+        # bbwp() discarded it. Measured 8.6x slower on a 200k-candle series
+        # for vol_lookback=-19 at bb_period=20 before this guard existed.
+        # This test pins correctness (still None); the performance
+        # characteristic isn't asserted here (flake risk) but was verified
+        # manually — see the PR/QA report for the measured numbers.
+        cfg = get_config("BTC", bb_period=20)
+        daily = make_candles([100.0 + (i % 7) for i in range(300)])
+        intraday = make_candles([500.0] * 10)
+        ta = compute_ta_state(intraday, daily, config=cfg, vol_lookback=-19)
+        assert ta.bb_width_pct is None
+        ta_intraday = compute_ta_state(
+            intraday, daily, config=cfg, intraday_vol_lookback=-19
+        )
+        assert ta_intraday.intraday_bb_width_pct is None
+
+    def test_additive_only_existing_fields_unchanged_by_vol_lookback(self) -> None:
+        # AC-6: every existing TAState field keeps its current value —
+        # passing vol_lookback/intraday_vol_lookback/vol_min_samples may
+        # only populate the three new fields.
+        daily = make_candles([500.0 + i * 0.3 for i in range(60)])
+        intraday = make_candles([501.0 + (i % 5) * 0.1 for i in range(60)])
+        cfg = get_config("SPY")
+        without = compute_ta_state(intraday, daily, config=cfg)
+        with_lookback = compute_ta_state(
+            intraday,
+            daily,
+            config=cfg,
+            vol_lookback=20,
+            intraday_vol_lookback=15,
+            vol_min_samples=3,
+        )
+        new_fields = {"bb_width_pct", "intraday_bb_width", "intraday_bb_width_pct"}
+        for f in dataclasses.fields(TAState):
+            if f.name in new_fields:
+                continue
+            assert getattr(without, f.name) == getattr(with_lookback, f.name), f.name

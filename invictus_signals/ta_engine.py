@@ -73,6 +73,213 @@ def calculate_bb(
     return {"upper": upper, "middle": middle, "lower": lower, "width": width}
 
 
+def bbwp(
+    widths: Sequence[float],
+    lookback: int,
+    min_samples: int = 2,
+) -> float | None:
+    """Percentile rank (0-100) of the FINAL element of *widths* within the
+    trailing *lookback* window (Bollinger Band Width Percentile).
+
+    Naming note (code-review finding, 2026-07-26): every other public
+    function in this module is `calculate_<name>` — `bbwp` is a deliberate,
+    known exception, not an oversight. `bbwp` is the exact name specified by
+    the four-layer-order PRD's AC-5 (`invictus_signals.ta_engine.bbwp(...)`)
+    and is also the industry-standard name for this specific indicator
+    (Bollinger Band Width Percentile), so renaming to `calculate_bbwp` would
+    both diverge from the spec it implements and read as a made-up
+    abbreviation rather than a recognized term. It is additionally already a
+    cross-repo interface: invictus-bot's regime_vol wiring is built against
+    this exact name. A rename is not being made unilaterally in this PR —
+    see the code review record for the full disposition.
+
+    Stdlib only — no numpy/scipy. Hand-rolled rank: take the trailing window,
+    then count how many of the *other* elements the final element beats.
+
+    Rank convention (load-bearing — read before changing):
+        **Strictly-less-than.** For each other element ``w`` in the window,
+        it counts toward the numerator iff ``w < target`` (ties do NOT count).
+        percentile = 100 * count_strictly_less / len(finite comparison
+        members). That denominator equals ``window_size - 1`` only when no
+        NaN/inf was filtered out of the window's other members — see the
+        NaN-handling note below for the case where it doesn't (code-review
+        finding, 2026-07-26: an earlier version of this docstring stated the
+        formula as always ``window_size - 1``, which was wrong on that path).
+        Consequence: a fresh window all-time-HIGH (target is the unique max)
+        reads as exactly 100.0; a fresh all-time-LOW reads as exactly 0.0.
+        A less-or-equal convention would also send a unique max to 100, but
+        would inflate the rank of any value merely *tied* with lesser peers —
+        strictly-less-than is the more conservative, more common convention
+        (mirrors the community BBWP scripts this metric is named after) and
+        is what this function implements.
+
+    Degenerate case — every value in the window is identical:
+        Returns **50.0** (neutral), not 100.0, 0.0, or None. Rationale: a
+        constant window has nothing to rank against, so neither "extremely
+        compressed" (0) nor "extremely expanded" (100) is true — reporting an
+        extreme would tell a downstream bucket exactly the wrong thing. 50.0
+        (the NORMAL bucket) is also distinct from ``None``, which this
+        function reserves for "cannot compute at all" (e.g. insufficient
+        history) — a flat-but-present window is a different failure mode
+        than a missing one and must not collapse to the same sentinel.
+
+    Sad paths (all return ``None`` — never a guessed number, and never an
+    exception — an empty or undersized ``widths`` is a data problem, not a
+    programming error, on a public function other consumers call directly):
+        - ``widths`` is empty, or ``len(widths) < min_samples`` — not enough
+          history at all. These are two separate checks (an empty sequence
+          is rejected unconditionally, independent of whatever
+          ``min_samples`` the caller passed — code-review finding, 2026-07-26:
+          a caller-supplied ``min_samples <= 0`` used to slip past the
+          length check and crash with ``IndexError`` on ``window[-1]``).
+        - ``lookback <= 1`` — a window of 0 or 1 elements has nothing to rank
+          the final element against (the denominator would be <= 0).
+        - The final element itself is non-finite (NaN **or** ±inf) — an
+          undefined or unbounded target cannot be ranked. (Code-review
+          finding, 2026-07-26: this used to check only ``isnan``, so an
+          overflowed/invalid ``+inf`` or ``-inf`` target read as a confident
+          100.0 or 0.0 — a plausible-looking number computed from garbage —
+          while the *comparison* members were already held to the stricter
+          ``isfinite`` standard. Both sides of the rank now use the same
+          finiteness rule.)
+        - After dropping non-finite (NaN/inf) elements from the *other*
+          window members, zero valid comparison points remain (every other
+          window member was itself NaN/inf) — same reasoning as the
+          lookback<=1 case, just discovered after filtering.
+
+    Other behavior:
+        - **Fewer elements than lookback but >= min_samples**: ranks within
+          whatever is actually available — ``effective_lookback =
+          min(lookback, len(widths))`` — the same degrade-gracefully pattern
+          `compute_ta_state` already uses for its MA/BB periods. This is not
+          a guess; it is ranking against a smaller, but still real, window.
+        - **NaN elsewhere in the window** (not the target): excluded from
+          both the numerator and the denominator rather than counted as
+          "not less than" — comparing against NaN is well-defined in Python
+          (always False) but silently deflates the percentile if left in the
+          denominator, so it is filtered out instead.
+        - **Negative widths**: not special-cased. A Bollinger bandwidth is
+          structurally non-negative in practice, but this function only
+          ranks floats — it does not validate width semantics — so a
+          negative value (or any float) compares and ranks normally.
+
+    Caller responsibility — the one property this function CANNOT check
+    and CANNOT return an error for, because a violation still produces a
+    clean, in-range float that looks exactly like a valid rank:
+        **The window must actually span more than one volatility regime.**
+        A rank is only informative if the trailing window contains both
+        compressed and expanded periods to rank the target against. If the
+        whole window sits inside one regime (e.g. a lookback short enough
+        that it only ever sees the tail end of a single sustained move),
+        the rank degenerates into noise — dominated by tiny variations in a
+        near-constant series, uniformly distributed 0-100 with no signal,
+        rather than by anything a downstream COMPRESSED/EXTENDED cut should
+        act on. Verified empirically: a monotonically-rising width series
+        breaking out of flat compression reads 100.0 from day one of the
+        rise and stays pinned there for the whole leg — not a bug in this
+        function or a consequence of the strictly-less-than convention
+        above (a less-or-equal convention does the same), but a direct
+        consequence of a window whose composition never changed regime.
+        This is exactly why the lookback is caller-supplied rather than
+        fixed: a daily-bar lookback and an intraday-bar lookback need
+        different bar-counts to span a comparable economic window, and
+        picking one number for both (rather than calibrating each) is a
+        common way to violate this property silently.
+
+        **A high level is NOT exhaustion — this is the single most
+        misusable property of the return value.** A caller can read 100.0
+        and conclude "this leg is spent" and be flatly wrong: the rank
+        answers "is TODAY'S width the widest in the trailing window," and a
+        healthy, still-accelerating trend satisfies that on the FIRST day
+        it breaks out of compression, not just at its exhausted end (see
+        the regime-spanning finding directly above — every day of a
+        sustained monotonic rise reads 100.0, start to finish, because each
+        new bar is only ever compared against lower/equal prior bars).
+        Percentile *level* alone cannot distinguish the start of a big move
+        from the end of one; both are "widest in the lookback." Telling
+        them apart needs a term this function does not compute — a
+        derivative (is the level rolling over, not just high) or a duration
+        condition (has it been high for a while, not just today) — layered
+        on top of the level by the caller. Do not use a bare `bbwp()`
+        reading as a proxy for "spent" without one.
+
+    Args:
+        widths: Historical bandwidth series (e.g. `TAState.bb_width` values
+            over time), most-recent last. The last element is the one being
+            ranked.
+        lookback: Trailing window size to rank within. Caller-supplied —
+            this library hardcodes no lookback (per-asset calibration is a
+            bot-level decision; see the PRD's D-2).
+        min_samples: Minimum total history required before a rank is
+            attempted (the floor is 2 — the mathematical minimum for a rank
+            to exist at all: the target plus one point to compare against).
+
+    Returns:
+        Percentile rank 0.0-100.0, or None per the sad paths above.
+    """
+    if not widths or len(widths) < min_samples:
+        return None
+    if lookback <= 1:
+        return None
+
+    effective_lookback = min(lookback, len(widths))
+    window = list(widths[-effective_lookback:])
+    target = window[-1]
+
+    if not math.isfinite(target):
+        return None
+
+    comparable = [w for w in window[:-1] if math.isfinite(w)]
+    if len(comparable) < 1:
+        return None
+
+    if all(w == target for w in comparable):
+        return 50.0
+
+    count_less = sum(1 for w in comparable if w < target)
+    return 100.0 * count_less / len(comparable)
+
+
+def _rolling_bb_widths(
+    closes: Sequence[float],
+    period: int,
+    std_dev: float,
+) -> list[float]:
+    """Bollinger bandwidth at every trailing position along *closes* where a
+    full *period*-length window exists, most-recent last.
+
+    Private helper feeding `bbwp()`: a percentile rank needs a series of
+    *actually realized* historical widths, not one snapshot repeated — so
+    this recomputes `calculate_bb`'s width at each position rather than
+    inventing a second normalization. The last element always equals a
+    direct `calculate_bb(closes, period, std_dev)["width"]` call on the same
+    *closes* — same window, same guard (a zero/near-zero middle yields 0.0,
+    never a ZeroDivisionError, per `calculate_bb`).
+
+    Returns an empty list if *period* < 2 or there isn't a full window yet
+    (never raises — callers treat an empty result as "nothing to rank").
+
+    Slices a fixed *period*-length window per position (``closes[i + 1 -
+    period : i + 1]``), not the growing prefix ``closes[: i + 1]`` — the
+    latter still produces the correct output (`calculate_bb` re-slices to
+    ``prices[-period:]`` internally regardless of how much extra history
+    it's handed) but copies up to the ENTIRE series on every iteration,
+    making
+    the loop O(n^2) instead of the intended O(n*period) (code-review
+    finding, 2026-07-26 — verified output-identical before/after by the
+    existing test suite; this is a pure performance fix, not a behavior
+    change).
+    """
+    if period < 2 or len(closes) < period:
+        return []
+    return [
+        calculate_bb(closes[i + 1 - period : i + 1], period=period, std_dev=std_dev)[
+            "width"
+        ]
+        for i in range(period - 1, len(closes))
+    ]
+
+
 def calculate_vwap(candles: Sequence[Candle]) -> float:
     """Volume-weighted average price over a sequence of candles.
 
@@ -296,6 +503,9 @@ def compute_ta_state(
     candles: Sequence[Candle],
     daily_candles: Sequence[Candle],
     config: AssetConfig | None = None,
+    vol_lookback: int | None = None,
+    intraday_vol_lookback: int | None = None,
+    vol_min_samples: int = 2,
 ) -> TAState:
     """Compute the full TAState from intraday + daily candle history.
 
@@ -304,9 +514,74 @@ def compute_ta_state(
     Periods come from the AssetConfig (defaults to SPY).
 
     Args:
-        candles: Intraday bars for the current session (most-recent last).
+        candles: Intraday bars (most-recent last). Historically documented
+            as "the current session," which is exactly what `vwap` wants
+            (`calculate_vwap` has no internal windowing — it averages the
+            ENTIRE sequence handed to it, unlike `intraday_ma_fast`/
+            `intraday_ma_mid`/`intraday_adx`, which all internally window to
+            a bounded trailing slice regardless of how much history they're
+            given). If `intraday_vol_lookback` is armed, this SAME series is
+            also what `intraday_bb_width_pct` ranks against, and per
+            `bbwp()`'s regime-spanning requirement, a rank needs enough bars
+            to span more than one volatility regime — a single session
+            almost never does (code-review finding, 2026-07-26).
+            **These two requirements are in genuine, unresolved tension, not
+            a documentation nit (QA-swarm finding, cross-model verified,
+            2026-07-26):** widening `candles` to a multi-session buffer
+            makes `intraday_bb_width_pct` meaningful but silently makes
+            `vwap` a multi-session average instead of a session VWAP — this
+            function has no way to serve both from one argument. It is NOT
+            introduced by this parameter: any existing caller already
+            passing a multi-bar rolling buffer here (rather than literally
+            resetting at session boundaries) already has this exact
+            trade-off today, with or without `intraday_vol_lookback` — this
+            parameter only makes the trade-off visible by giving a reason to
+            widen the buffer on purpose. Resolving it properly (e.g. a
+            second, dedicated historical-only intraday series) is an
+            architecture change outside this PR's additive-only scope — a
+            caller arming `intraday_vol_lookback` today is choosing to
+            accept `vwap`'s scope widening, not avoiding a cost.
         daily_candles: Daily OHLCV bars (most-recent last).
         config: Asset configuration. Defaults to SPY preset.
+        vol_lookback: Trailing window for `bb_width_pct` (the DAILY BBWP
+            rank) — one bar = one day. **No default is hardcoded here** —
+            per-asset calibration is a bot-level decision (PRD D-2); when
+            omitted (`None`, the default), `bb_width_pct` stays `None` and
+            this function's behavior for every existing field is unchanged
+            from before this parameter existed (additive-only, AC-6).
+        intraday_vol_lookback: Trailing window for `intraday_bb_width_pct`
+            (the INTRADAY BBWP rank) — one bar = whatever timeframe
+            *candles* is (1H, 15M, ...). **Deliberately separate from
+            `vol_lookback`, not a shared/reused value.** One integer cannot
+            serve both lenses: `vol_lookback=252` means ~1 year on daily
+            bars but ~10.5 days on 1H bars or ~2.6 days on 15M bars — a
+            window that short on 15M almost never spans both a compressed
+            and an expanded regime, so the rank it produces is
+            noise-dominated (see `bbwp()`'s docstring on regime-spanning,
+            and the `candles` note above on the "current session" pitfall).
+            Defaults to `None`, meaning "don't compute the intraday rank"
+            — it does **not** silently fall back to `vol_lookback`, because
+            a plausible-looking number computed on the wrong timeframe's
+            scale is worse than an honest `None`.
+        vol_min_samples: Forwarded to `bbwp()`'s `min_samples` for both
+            percentile calls. Defaults to `bbwp()`'s own floor (2) — pure
+            passthrough, not a second default invented here. Exists so an
+            asset with structurally short daily history (SPCX,
+            `SPCX_MIN_DAILY_CANDLES=50`) can be made to abstain
+            (`bb_width_pct=None`) **by construction** rather than by
+            incidentally having too few candles today: without this, a
+            caller has no lever over `compute_ta_state` itself and must
+            gate candle length *before* calling in, which is easy to forget
+            and impossible to unit-test from this function's boundary.
+            **Units, precisely (code-review finding, 2026-07-26):** this
+            floor is compared against the ROLLING-WIDTH count
+            (`len(daily_closes) - bb_period + 1`), not the raw daily-candle
+            count — the two differ by `bb_period - 1`. To require at least
+            N daily candles before ranking (mirroring
+            `SPCX_MIN_DAILY_CANDLES`), pass `vol_min_samples = N - bb_period
+            + 1`, not `N` itself — e.g. at the default `bb_period=20`,
+            requiring 50 daily candles means passing `vol_min_samples=31`,
+            not `50`.
 
     Returns:
         Populated TAState.
@@ -387,9 +662,66 @@ def compute_ta_state(
         )
         intraday_bb_upper = intraday_bb["upper"]
         intraday_bb_lower = intraday_bb["lower"]
+        intraday_bb_width = intraday_bb["width"]
     else:
         intraday_bb_upper = 0.0
         intraday_bb_lower = 0.0
+        intraday_bb_width = 0.0
+
+    # --- Bandwidth percentiles (BBWP, additive — four-layer-order PRD Phase 1).
+    # Each lens only attempted when the caller supplies ITS OWN lookback;
+    # otherwise it stays None (see vol_lookback/intraday_vol_lookback's
+    # docstrings — deliberately two separate params, never one reused for
+    # both scales). Ranks the FINAL element of a rolling widths series built
+    # from calculate_bb at every trailing position, so the target being
+    # ranked is always identical to bb["width"] / intraday_bb["width"]
+    # above — never a second, divergent computation.
+    #
+    # Each series is pre-sliced to just the tail `_rolling_bb_widths` needs
+    # to produce `lookback` rolling widths (`lookback + period - 1` closes)
+    # before that helper runs — `bbwp()` only ever reads its trailing
+    # `lookback` widths anyway, so computing widths further back was pure
+    # waste (code-review finding, 2026-07-26: on invictus-bot's real
+    # candle-history depths, roughly half the rolling widths computed were
+    # discarded unread on every eval cycle). A no-op when history is already
+    # shorter than needed — `closes[-needed:]` on a shorter list returns the
+    # whole list unchanged, so nothing is lost when there's less history
+    # than the caller's lookback asks for.
+    #
+    # The `> 1` conjunct (QA-swarm finding, 2026-07-26, cross-model): a
+    # `vol_lookback` bbwp() will reject anyway (<=1, including negative)
+    # used to still compute `daily_needed = vol_lookback + bb_period - 1`,
+    # which goes to 0 or negative for a sufficiently negative lookback —
+    # `daily_closes[-0:]` is the WHOLE list, not an empty one, so an
+    # obviously-invalid lookback silently ran the full-history rolling-width
+    # scan anyway before bbwp() discarded it. Measured 8.6x slower
+    # (0.330s vs 0.038s) on a 200k-candle series for a pathological
+    # `vol_lookback=-19`. Rejecting `lookback<=1` here, before doing any
+    # work, mirrors bbwp()'s own guard instead of relying on it downstream.
+    if vol_lookback is not None and vol_lookback > 1 and bb_period >= 2:
+        daily_needed = vol_lookback + bb_period - 1
+        daily_widths = _rolling_bb_widths(
+            daily_closes[-daily_needed:], bb_period, cfg.bb_std_dev
+        )
+        bb_width_pct = bbwp(daily_widths, vol_lookback, min_samples=vol_min_samples)
+    else:
+        bb_width_pct = None
+
+    if (
+        intraday_vol_lookback is not None
+        and intraday_vol_lookback > 1
+        and intraday_bb_period >= 2
+    ):
+        intraday_needed = intraday_vol_lookback + intraday_bb_period - 1
+        intraday_widths = _rolling_bb_widths(
+            intraday_closes[-intraday_needed:], intraday_bb_period, cfg.bb_std_dev
+        )
+        intraday_bb_width_pct = bbwp(
+            intraday_widths, intraday_vol_lookback, min_samples=vol_min_samples
+        )
+    else:
+        intraday_bb_width_pct = None
+
     intraday_slope_period = min(5, n_intraday)
     if intraday_slope_period >= 2:
         intraday_close_slope = calculate_slope(intraday_closes, intraday_slope_period)
@@ -440,4 +772,7 @@ def compute_ta_state(
         intraday_ma_mid=intraday_ma_mid,
         intraday_bb_upper=intraday_bb_upper,
         intraday_bb_lower=intraday_bb_lower,
+        bb_width_pct=bb_width_pct,
+        intraday_bb_width=intraday_bb_width,
+        intraday_bb_width_pct=intraday_bb_width_pct,
     )

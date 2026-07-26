@@ -1,0 +1,30 @@
+# Mock Quality + Mutation Proxy Report — invictus-signals PR #8
+
+## Vacuous mocks: none found (structurally correct — zero I/O)
+`grep -rniE "mock|magicmock|unittest\.mock|monkeypatch|\.patch\("` over `tests/test_ta_engine.py` and `tests/test_models.py`: **zero hits**. Correct posture for a pure-function, zero-I/O library.
+
+**A self-referential-oracle analogue was found and fixed this pass** (not a mock, but the same underlying failure mode: an assertion that can't distinguish correct from incorrect implementation). See P1-1 below.
+
+## Mutation Proxy Results
+
+| Function | Mutation | Would tests catch it? | Which test | Finding |
+|---|---|---|---|---|
+| `bbwp()` | `w < target` → `w <= target` | YES | `test_ties_with_target_do_not_count_toward_numerator` | Pinned. |
+| `bbwp()` | denominator `len(comparable)` → `len(window)` | YES | `test_fresh_all_time_high_reads_as_100`, `test_nan_elsewhere_in_window_is_excluded_not_counted` | Both the normal and NaN-filtered denominator paths pinned. |
+| `bbwp()` | degenerate `50.0` → `0.0` | YES | `test_degenerate_all_identical_widths_returns_50` | Exact-value assert. |
+| `bbwp()` | remove `not widths or len(widths) < min_samples` guard | YES (3 independent detectors) | `test_none_below_min_samples`, `test_min_samples_le_zero_returns_none_not_indexerror`, `test_vol_min_samples_makes_short_history_abstain_structurally` | Pinned from 3 angles. |
+| `bbwp()` | `isfinite(target)` → `isnan(target)` (partial revert) | YES | `test_positive_infinity_target_returns_none`, `test_negative_infinity_target_returns_none` | Pinned both directions. |
+| `bbwp()` | `min(lookback, len(widths))` → `lookback` | NO — equivalent mutant | n/a | `widths[-lookback:]` and `widths[-min(lookback,len):]` are byte-identical in Python for `lookback>1`; not a real gap. |
+| `_rolling_bb_widths()` | window-start off-by-one | YES | `test_last_element_matches_direct_calculate_bb` et al. | Errors loudly (`calculate_bb` raises on an empty/short slice), not a silent wrong number. |
+| `_rolling_bb_widths()` | skip first valid position | YES | `test_length_is_series_len_minus_period_plus_1`, `test_zero_mean_window_yields_zero_width_no_crash` | Length invariant explicitly asserted. |
+| `compute_ta_state()` | drop `bb_period >= 2` guard | NO — equivalent mutant | n/a | Double-guarded: `_rolling_bb_widths` independently returns `[]` for `period<2`, so `bbwp([])` → `None` either way. Defense-in-depth, not a gap. |
+| `compute_ta_state()` | intraday call uses `vol_lookback` instead of `intraday_vol_lookback` | **Originally: YES but for the wrong reason** (crashed via `None<=int` TypeError, not a value mismatch) — **now: YES for the RIGHT reason** | `test_both_lenses_armed_with_different_lookbacks_rank_independently` (added this pass) | Was P2 (fixed): no test armed both lookbacks with different values and checked the intraday lens used its OWN value; the actual fixed bug (silent fallback) would have escaped a value-based check entirely. |
+| `compute_ta_state()` | remove `vol_min_samples` passthrough (intraday call only) | **Originally: NO** — **now: YES** | `test_vol_min_samples_makes_intraday_lens_abstain_structurally_too` (added this pass) | Was P2 (fixed): asymmetric coverage, daily pinned, intraday not. |
+| `TAState` | `intraday_bb_width_pct` default `None` → `0.0` | **Originally: NO** — **now: YES** (empirically verified — the mutation was manually applied and confirmed to fail the new test, then reverted) | `test_bandwidth_percentile_fields_default_to_absent` (added this pass, `tests/test_models.py`) | Was P1 (fixed): `compute_ta_state` always passes all 3 new fields explicitly, so no `compute_ta_state`-level test could ever exercise the dataclass DEFAULT. `test_models.py` was never extended for this PR's fields. |
+| `TAState` | reorder a defaulted field | **NO** (harmless in-repo; cross-repo exposure) | n/a | Nothing asserts field order; all 14 repo-wide `TAState(...)` sites are keyword-only, so this is a genuine no-op locally. **Accepted, not fixed** — a field-order contract test (`assert tuple(f.name for f in fields(TAState)) == (...)`) was considered and rejected as adding brittleness (any future legitimate field addition breaks it) for a risk that's entirely cross-repo (Foresight/Options Intel tuple-serializing or positionally constructing `TAState`, which no current code does). |
+
+## Bottom line
+Of 12 traced mutations: 2 are equivalent mutants (not real gaps, correctly not fixed), 4 were already caught, 4 were real gaps and are now fixed with new regression tests (2 P1, 2 P2), 1 (the money-path value-assertions being self-referential on a monotone fixture — see below) is a 5th real gap, also fixed, and 1 (field ordering) is a legitimate but low-value residual risk, accepted as-is with the reasoning recorded above rather than silently dropped.
+
+## The 5th finding: self-referential-oracle assertions on a degenerate fixture (P1, FIXED)
+`test_bb_width_pct_matches_manual_bbwp_over_rolling_widths` and `test_intraday_bb_width_pct_matches_manual_bbwp` computed their `expected` value by calling the same production functions under test (`bbwp(_rolling_bb_widths(...))`) — structurally fine for a wiring test (it verifies `compute_ta_state` plumbs the right arguments through, not `bbwp()`'s own math, which is separately hand-verified in `TestBBWP`). But the fixture (`prices = [100.0 + i for i in range(30)]`, monotone-linear) made bandwidth *strictly decreasing* for a fixed period (constant sigma, rising mean), so the ranked target was always the window's unique minimum **regardless of which window was actually selected**. Mutating the pre-slice arithmetic (`daily_needed = vol_lookback + bb_period - 1` → `vol_lookback`) — a real, previously-shipped bug class — changes which window gets ranked, but both sides of the assertion still evaluate to `0.0`, so the test would not have caught it. Fixed with a deterministic, non-monotone fixture (`_oscillating_prices`) plus an explicit `0.0 < expected < 100.0` non-degeneracy guard.
