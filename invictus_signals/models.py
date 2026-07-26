@@ -168,6 +168,29 @@ class TAState:
     # upper band (always > 0 for positive prices); 0.0 = absent → daily fallback.
     intraday_bb_upper: float = 0.0
     intraday_bb_lower: float = 0.0
+    # Bandwidth percentiles (BBWP) — additive, Phase 1 of the four-layer-order
+    # PRD (docs/prd/four-layer-order/four-layer-order.md, AC-6). Two separate
+    # scales, mirroring why intraday_bb_upper/lower exist alongside the daily
+    # bb_upper/lower (PR #7, dnt_16 precedent): a regime-scale read and an
+    # entry-timeframe read answer different questions and must not collapse
+    # into one field.
+    #   bb_width_pct          — percentile of the DAILY bandwidth (regime-scale,
+    #                            "is the daily leg coiled or spent").
+    #   intraday_bb_width      — normalized INTRADAY bandwidth, same (u-l)/mid
+    #                            form as bb_width, just computed on the
+    #                            intraday closes. No lookback needed — it is
+    #                            the current snapshot, not a rank.
+    #   intraday_bb_width_pct  — percentile of the INTRADAY bandwidth
+    #                            (entry-scale, what dnt_16-style consumers on
+    #                            the 15m/1h timeframe should key off).
+    # None on the two `_pct` fields means "not computed" — either the caller
+    # didn't supply a lookback, or `bbwp()` returned None (see its docstring
+    # for the sad paths: insufficient history, lookback<=1, NaN target).
+    # Never interpolated or guessed. 0.0 on `intraday_bb_width` is the same
+    # "absent" sentinel already used by intraday_bb_upper/lower.
+    bb_width_pct: float | None = None
+    intraday_bb_width: float = 0.0
+    intraday_bb_width_pct: float | None = None
 
 
 @dataclass

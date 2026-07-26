@@ -73,6 +73,130 @@ def calculate_bb(
     return {"upper": upper, "middle": middle, "lower": lower, "width": width}
 
 
+def bbwp(
+    widths: Sequence[float],
+    lookback: int,
+    min_samples: int = 2,
+) -> float | None:
+    """Percentile rank (0-100) of the FINAL element of *widths* within the
+    trailing *lookback* window (Bollinger Band Width Percentile).
+
+    Stdlib only — no numpy/scipy. Hand-rolled rank: take the trailing window,
+    then count how many of the *other* elements the final element beats.
+
+    Rank convention (load-bearing — read before changing):
+        **Strictly-less-than.** For each other element ``w`` in the window,
+        it counts toward the numerator iff ``w < target`` (ties do NOT count).
+        percentile = 100 * count_strictly_less / (window_size - 1).
+        Consequence: a fresh window all-time-HIGH (target is the unique max)
+        reads as exactly 100.0; a fresh all-time-LOW reads as exactly 0.0.
+        A less-or-equal convention would also send a unique max to 100, but
+        would inflate the rank of any value merely *tied* with lesser peers —
+        strictly-less-than is the more conservative, more common convention
+        (mirrors the community BBWP scripts this metric is named after) and
+        is what this function implements.
+
+    Degenerate case — every value in the window is identical:
+        Returns **50.0** (neutral), not 100.0, 0.0, or None. Rationale: a
+        constant window has nothing to rank against, so neither "extremely
+        compressed" (0) nor "extremely expanded" (100) is true — reporting an
+        extreme would tell a downstream bucket exactly the wrong thing. 50.0
+        (the NORMAL bucket) is also distinct from ``None``, which this
+        function reserves for "cannot compute at all" (e.g. insufficient
+        history) — a flat-but-present window is a different failure mode
+        than a missing one and must not collapse to the same sentinel.
+
+    Sad paths (all return ``None`` — never a guessed number):
+        - ``len(widths) < min_samples`` — not enough history at all.
+        - ``lookback <= 1`` — a window of 0 or 1 elements has nothing to rank
+          the final element against (the denominator would be <= 0).
+        - The final element itself is NaN — an undefined target cannot be
+          ranked.
+        - After dropping non-finite (NaN/inf) elements from the *other*
+          window members, zero valid comparison points remain (every other
+          window member was itself NaN/inf) — same reasoning as the
+          lookback<=1 case, just discovered after filtering.
+
+    Other behavior:
+        - **Fewer elements than lookback but >= min_samples**: ranks within
+          whatever is actually available — ``effective_lookback =
+          min(lookback, len(widths))`` — the same degrade-gracefully pattern
+          `compute_ta_state` already uses for its MA/BB periods. This is not
+          a guess; it is ranking against a smaller, but still real, window.
+        - **NaN elsewhere in the window** (not the target): excluded from
+          both the numerator and the denominator rather than counted as
+          "not less than" — comparing against NaN is well-defined in Python
+          (always False) but silently deflates the percentile if left in the
+          denominator, so it is filtered out instead.
+        - **Negative widths**: not special-cased. A Bollinger bandwidth is
+          structurally non-negative in practice, but this function only
+          ranks floats — it does not validate width semantics — so a
+          negative value (or any float) compares and ranks normally.
+
+    Args:
+        widths: Historical bandwidth series (e.g. `TAState.bb_width` values
+            over time), most-recent last. The last element is the one being
+            ranked.
+        lookback: Trailing window size to rank within. Caller-supplied —
+            this library hardcodes no lookback (per-asset calibration is a
+            bot-level decision; see the PRD's D-2).
+        min_samples: Minimum total history required before a rank is
+            attempted (the floor is 2 — the mathematical minimum for a rank
+            to exist at all: the target plus one point to compare against).
+
+    Returns:
+        Percentile rank 0.0-100.0, or None per the sad paths above.
+    """
+    if len(widths) < min_samples:
+        return None
+    if lookback <= 1:
+        return None
+
+    effective_lookback = min(lookback, len(widths))
+    window = list(widths[-effective_lookback:])
+    target = window[-1]
+
+    if math.isnan(target):
+        return None
+
+    comparable = [w for w in window[:-1] if math.isfinite(w)]
+    if len(comparable) < 1:
+        return None
+
+    if all(w == target for w in comparable):
+        return 50.0
+
+    count_less = sum(1 for w in comparable if w < target)
+    return 100.0 * count_less / len(comparable)
+
+
+def _rolling_bb_widths(
+    closes: Sequence[float],
+    period: int,
+    std_dev: float,
+) -> list[float]:
+    """Bollinger bandwidth at every trailing position along *closes* where a
+    full *period*-length window exists, most-recent last.
+
+    Private helper feeding `bbwp()`: a percentile rank needs a series of
+    *actually realized* historical widths, not one snapshot repeated — so
+    this recomputes `calculate_bb`'s width at each position rather than
+    inventing a second normalization. The last element always equals a
+    direct `calculate_bb(closes, period, std_dev)["width"]` call on the same
+    *closes* — same window, same guard (a zero/near-zero middle yields 0.0,
+    never a ZeroDivisionError, per `calculate_bb`).
+
+    Returns an empty list if *period* < 2 or there isn't a full window yet
+    (never raises — callers treat an empty result as "nothing to rank").
+    """
+    if period < 2 or len(closes) < period:
+        return []
+    return [
+        calculate_bb(closes[: i + 1], period=period, std_dev=std_dev)["width"]
+        for i in range(period - 1, len(closes))
+    ]
+
+
 def calculate_vwap(candles: Sequence[Candle]) -> float:
     """Volume-weighted average price over a sequence of candles.
 
@@ -296,6 +420,7 @@ def compute_ta_state(
     candles: Sequence[Candle],
     daily_candles: Sequence[Candle],
     config: AssetConfig | None = None,
+    vol_lookback: int | None = None,
 ) -> TAState:
     """Compute the full TAState from intraday + daily candle history.
 
@@ -307,6 +432,16 @@ def compute_ta_state(
         candles: Intraday bars for the current session (most-recent last).
         daily_candles: Daily OHLCV bars (most-recent last).
         config: Asset configuration. Defaults to SPY preset.
+        vol_lookback: Trailing window for the BBWP percentile rank
+            (`bbwp()`), applied to BOTH `bb_width_pct` (daily) and
+            `intraday_bb_width_pct` (intraday) — mirroring how
+            `intraday_bb_upper`/`intraday_bb_lower` reuse the daily
+            `bb_period`/`bb_std_dev` rather than inventing a second
+            constant. **No default is hardcoded here** — per-asset
+            calibration is a bot-level decision (PRD D-2); when omitted
+            (`None`, the default), both `_pct` fields stay `None` and this
+            function's behavior for every existing field is unchanged from
+            before this parameter existed (additive-only, AC-6).
 
     Returns:
         Populated TAState.
@@ -387,9 +522,32 @@ def compute_ta_state(
         )
         intraday_bb_upper = intraday_bb["upper"]
         intraday_bb_lower = intraday_bb["lower"]
+        intraday_bb_width = intraday_bb["width"]
     else:
         intraday_bb_upper = 0.0
         intraday_bb_lower = 0.0
+        intraday_bb_width = 0.0
+
+    # --- Bandwidth percentiles (BBWP, additive — four-layer-order PRD Phase 1).
+    # Only attempted when the caller supplies a lookback; otherwise both stay
+    # None (see vol_lookback's docstring). Ranks the FINAL element of a
+    # rolling widths series built from calculate_bb at every trailing
+    # position, so the target being ranked is always identical to bb["width"]
+    # / intraday_bb["width"] above — never a second, divergent computation.
+    if vol_lookback is not None and bb_period >= 2:
+        daily_widths = _rolling_bb_widths(daily_closes, bb_period, cfg.bb_std_dev)
+        bb_width_pct = bbwp(daily_widths, vol_lookback)
+    else:
+        bb_width_pct = None
+
+    if vol_lookback is not None and intraday_bb_period >= 2:
+        intraday_widths = _rolling_bb_widths(
+            intraday_closes, intraday_bb_period, cfg.bb_std_dev
+        )
+        intraday_bb_width_pct = bbwp(intraday_widths, vol_lookback)
+    else:
+        intraday_bb_width_pct = None
+
     intraday_slope_period = min(5, n_intraday)
     if intraday_slope_period >= 2:
         intraday_close_slope = calculate_slope(intraday_closes, intraday_slope_period)
@@ -440,4 +598,7 @@ def compute_ta_state(
         intraday_ma_mid=intraday_ma_mid,
         intraday_bb_upper=intraday_bb_upper,
         intraday_bb_lower=intraday_bb_lower,
+        bb_width_pct=bb_width_pct,
+        intraday_bb_width=intraday_bb_width,
+        intraday_bb_width_pct=intraday_bb_width_pct,
     )
