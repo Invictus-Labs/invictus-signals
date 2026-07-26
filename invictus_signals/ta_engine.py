@@ -156,6 +156,23 @@ def bbwp(
         picking one number for both (rather than calibrating each) is a
         common way to violate this property silently.
 
+        **A high level is NOT exhaustion — this is the single most
+        misusable property of the return value.** A caller can read 100.0
+        and conclude "this leg is spent" and be flatly wrong: the rank
+        answers "is TODAY'S width the widest in the trailing window," and a
+        healthy, still-accelerating trend satisfies that on the FIRST day
+        it breaks out of compression, not just at its exhausted end (see
+        the regime-spanning finding directly above — every day of a
+        sustained monotonic rise reads 100.0, start to finish, because each
+        new bar is only ever compared against lower/equal prior bars).
+        Percentile *level* alone cannot distinguish the start of a big move
+        from the end of one; both are "widest in the lookback." Telling
+        them apart needs a term this function does not compute — a
+        derivative (is the level rolling over, not just high) or a duration
+        condition (has it been high for a while, not just today) — layered
+        on top of the level by the caller. Do not use a bare `bbwp()`
+        reading as a proxy for "spent" without one.
+
     Args:
         widths: Historical bandwidth series (e.g. `TAState.bb_width` values
             over time), most-recent last. The last element is the one being
